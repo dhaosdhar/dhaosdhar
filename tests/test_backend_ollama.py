@@ -478,3 +478,122 @@ def test_status_error_with_non_string_error_body(settings: Settings) -> None:
     backend, _ = make_backend(settings, handler)
     with pytest.raises(BackendError, match="HTTP 500 : .*out of memory"):
         backend.chat([Message("user", "?")])
+
+
+# --------------------------------------------------------------------------
+# Appels d'outils écrits en texte par le modèle (petits modèles locaux)
+# --------------------------------------------------------------------------
+from dhaos.backends.ollama import rescue_text_tool_calls  # noqa: E402
+
+LIST_DIR = ToolSpec(
+    name="list_dir",
+    description="Liste un dossier",
+    parameters={"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}},
+)
+NAMES = {"list_dir", "read_file"}
+
+
+@pytest.mark.parametrize(
+    "text, expected_names, remainder",
+    [
+        ('{"name": "list_dir", "arguments": {"path": "/x", "depth": 2}}', ["list_dir"], ""),
+        ('Je regarde.\n<tool_call>\n{"name":"read_file","arguments":{"path":"a.py"}}\n</tool_call>', ["read_file"], "Je regarde."),
+        ('<tool_call>{"name":"read_file","arguments":{"path":"a.py"}}', ["read_file"], ""),  # balise non fermée
+        ('```json\n{"name":"read_file","parameters":"{\\"path\\": \\"b.py\\"}"}\n```', ["read_file"], ""),
+        ('{"function": {"name": "list_dir", "arguments": {"path": "."}}}', ["list_dir"], ""),
+        ('{"tool_calls": [{"name": "list_dir", "arguments": {}}, {"name": "read_file", "arguments": {"path": "x"}}]}', ["list_dir", "read_file"], ""),
+        ('{"name":"list_dir","arguments":{"path":"."}}\n{"name":"read_file","arguments":{"path":"x"}}', ["list_dir", "read_file"], ""),
+    ],
+)
+def test_rescue_text_tool_calls_formats(text: str, expected_names: list[str], remainder: str) -> None:
+    rest, calls = rescue_text_tool_calls(text, NAMES)
+    assert [c["name"] for c in calls] == expected_names
+    assert rest == remainder
+    for c in calls:
+        assert isinstance(c["arguments"], dict)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"name": "inconnu", "arguments": {}}',  # outil non déclaré
+        'Voici {"a": 1} un objet quelconque.',
+        '{"name": "list_dir", "arguments": "pas du json"}',
+        '{"name": "list_dir", "arguments": [1, 2]}',
+        "Réponse normale sans accolade.",
+        "",
+    ],
+)
+def test_rescue_text_tool_calls_leaves_non_calls_alone(text: str) -> None:
+    rest, calls = rescue_text_tool_calls(text, NAMES)
+    assert calls == [] and rest == text
+
+
+def test_rescue_ignores_without_tool_names() -> None:
+    assert rescue_text_tool_calls('{"name": "list_dir", "arguments": {}}', set()) == ('{"name": "list_dir", "arguments": {}}', [])
+
+
+def test_chat_rescues_text_tool_call_and_holds_output(settings: Settings) -> None:
+    """Le modèle écrit l'appel en JSON dans content : dhaos le convertit en appel
+    structuré, ne diffuse pas le JSON et rejoue l'appel comme tool_calls."""
+    chunks = ['{"name": "list', '_dir", "arguments": ', '{"path": "/home/js", "depth": 2}}']
+    stream = [{"message": {"role": "assistant", "content": c}, "done": False} for c in chunks]
+    backend, seen = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="liste")], tools=[LIST_DIR], on_text=shown.append)
+    assert resp.stop_reason == "tool_use"
+    assert [c.name for c in resp.tool_calls] == ["list_dir"]
+    assert resp.tool_calls[0].arguments == {"path": "/home/js", "depth": 2}
+    assert resp.tool_calls[0].id.startswith("call_")
+    assert resp.text == "" and shown == []
+    assert resp.raw["tool_calls"] == [{"function": {"name": "list_dir", "arguments": {"path": "/home/js", "depth": 2}}}]
+    assert resp.raw["content"] == ""
+    body = json.loads(seen[0].content)
+    assert body["tools"][0]["function"]["name"] == "list_dir"
+
+
+def test_chat_rescue_keeps_prose_around_call(settings: Settings) -> None:
+    chunks = ["Je vais lister. ", '<tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>']
+    stream = [{"message": {"role": "assistant", "content": c}, "done": False} for c in chunks]
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="liste")], tools=[LIST_DIR], on_text=shown.append)
+    # La prose ne commence pas comme un appel : elle est diffusée immédiatement, le reste aussi
+    assert shown[0] == "Je vais lister. "
+    assert resp.text == "Je vais lister." and [c.name for c in resp.tool_calls] == ["list_dir"]
+
+
+def test_chat_normal_text_is_streamed_immediately(settings: Settings) -> None:
+    stream = [{"message": {"role": "assistant", "content": c}, "done": False} for c in ["Bon", "jour !"]]
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="salut")], tools=[LIST_DIR], on_text=shown.append)
+    assert shown == ["Bon", "jour !"] and resp.text == "Bonjour !" and resp.tool_calls == []
+    assert resp.stop_reason == "end_turn"
+
+
+def test_chat_json_that_is_not_a_call_is_flushed_at_end(settings: Settings) -> None:
+    stream = [{"message": {"role": "assistant", "content": c}, "done": False} for c in ['{"a": ', "1}"]]
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="json"), ], tools=[LIST_DIR], on_text=shown.append)
+    assert shown == ['{"a": 1}'] and resp.text == '{"a": 1}' and resp.tool_calls == []
+
+
+def test_chat_without_tools_does_not_hold_or_rescue(settings: Settings) -> None:
+    text = '{"name": "list_dir", "arguments": {}}'
+    stream = [{"message": {"role": "assistant", "content": text}, "done": False}]
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=None, on_text=shown.append)
+    assert shown == [text] and resp.text == text and resp.tool_calls == []
+
+
+def test_chat_structured_tool_call_wins_over_text(settings: Settings) -> None:
+    """Quand Ollama fournit message.tool_calls, le texte n'est pas réinterprété."""
+    stream = [
+        {"message": {"role": "assistant", "content": "ok", "tool_calls": [{"function": {"name": "list_dir", "arguments": {"path": "."}}}]}, "done": False},
+    ]
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR])
+    assert [c.name for c in resp.tool_calls] == ["list_dir"] and resp.text == "ok"

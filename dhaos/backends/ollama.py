@@ -10,6 +10,9 @@ Toutes les données reçues sont considérées comme non fiables et validées.
 from __future__ import annotations
 
 import json
+import os
+import re
+import sys
 import uuid
 from typing import Any
 
@@ -62,6 +65,148 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
         return {"_raw": json.loads(json.dumps(raw))}
     except (TypeError, ValueError):
         return {"_raw": str(raw)}
+
+
+
+_DEBUG = bool(os.environ.get("DHAOS_DEBUG"))
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.DOTALL)
+_FENCE_RE = re.compile(r"```(?:json|tool_call|tool)?[ \t]*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
+_TEXT_CALL_PREFIXES = ("{", "[", "<tool_call>", "```")
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG:
+        sys.stderr.write(f"[dhaos/ollama] {msg}\n")
+        sys.stderr.flush()
+
+
+def _iter_json_values(text: str):
+    """Itère ``(début, fin, valeur)`` pour chaque valeur JSON de premier niveau
+    (objet ou tableau) décodable dans ``text``, dans l'ordre d'apparition."""
+    decoder = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        starts = [k for k in (text.find("{", i), text.find("[", i)) if k != -1]
+        if not starts:
+            return
+        start = min(starts)
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            i = start + 1
+            continue
+        yield start, end, value
+        i = end
+
+
+def _call_from_object(obj: Any, tool_names: set[str]) -> dict[str, Any] | None:
+    """``{"name": outil, "arguments": {...}}`` (ou variantes) → appel normalisé."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj["function"] if isinstance(obj.get("function"), dict) else obj
+    name = fn.get("name")
+    if not isinstance(name, str) or name not in tool_names:
+        return None
+    args: Any = {}
+    for key in ("arguments", "parameters", "input", "args"):
+        if key in fn:
+            args = fn[key]
+            break
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return {"name": name, "arguments": args}
+
+
+def _calls_from_value(value: Any, tool_names: set[str]) -> list[dict[str, Any]]:
+    if isinstance(value, dict) and isinstance(value.get("tool_calls"), list):
+        value = value["tool_calls"]
+    items = value if isinstance(value, list) else [value]
+    calls = []
+    for item in items:
+        call = _call_from_object(item, tool_names)
+        if call:
+            calls.append(call)
+    return calls
+
+
+def rescue_text_tool_calls(text: str, tool_names: set[str]) -> tuple[str, list[dict[str, Any]]]:
+    """Récupère les appels d'outils qu'un modèle a écrits *en texte* au lieu
+    d'utiliser le mécanisme structuré : JSON nu ``{"name": …, "arguments": …}``,
+    balises ``<tool_call>…</tool_call>`` ou bloc ```json. Seuls les noms
+    d'outils connus sont acceptés. Renvoie le texte débarrassé des appels et la
+    liste des appels ``{"name", "arguments"}`` dans l'ordre d'apparition."""
+    if not text or not tool_names or "{" not in text:
+        return text, []
+    found: list[tuple[int, int, list[dict[str, Any]]]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(s < end and start < e for s, e, _ in found)
+
+    for regex in (_TOOL_CALL_TAG_RE, _FENCE_RE):
+        for m in regex.finditer(text):
+            if overlaps(m.start(), m.end()):
+                continue
+            calls = [c for _, _, v in _iter_json_values(m.group(1)) for c in _calls_from_value(v, tool_names)]
+            if calls:
+                found.append((m.start(), m.end(), calls))
+    for start, end, value in _iter_json_values(text):
+        if overlaps(start, end):
+            continue
+        calls = _calls_from_value(value, tool_names)
+        if calls:
+            found.append((start, end, calls))
+    if not found:
+        return text, []
+    found.sort(key=lambda t: t[0])
+    pieces, pos, calls = [], 0, []
+    for start, end, group in found:
+        pieces.append(text[pos:start])
+        calls.extend(group)
+        pos = end
+    pieces.append(text[pos:])
+    return "".join(pieces).strip(), calls
+
+
+class _TextGate:
+    """Retient la diffusion du texte tant qu'il peut s'agir d'un appel d'outil
+    écrit en clair (début ``{``, ``[``, ``<tool_call>`` ou ```) ; tout autre
+    début est diffusé immédiatement, puis le reste au fil de l'eau."""
+
+    def __init__(self, on_text: TextCallback | None, enabled: bool):
+        self.on_text = on_text
+        self.buffer = ""
+        self.passthrough = on_text is None or not enabled
+
+    def feed(self, chunk: str) -> None:
+        if self.on_text is None:
+            return
+        if self.passthrough:
+            self.on_text(chunk)
+            return
+        self.buffer += chunk
+        head = self.buffer.lstrip()
+        if not head:
+            return
+        if any(head.startswith(p) or p.startswith(head) for p in _TEXT_CALL_PREFIXES):
+            return  # candidat : on retient
+        self.passthrough = True
+        self.on_text(self.buffer)
+        self.buffer = ""
+
+    def finish(self, replacement: str | None = None) -> None:
+        if self.on_text is None or self.passthrough:
+            return
+        text = self.buffer if replacement is None else replacement
+        self.buffer = ""
+        if text:
+            self.on_text(text)
 
 
 class OllamaBackend(Backend):
@@ -179,6 +324,11 @@ class OllamaBackend(Backend):
         done_seen = False
         usage = Usage()
         model_name = self.model
+        gate = _TextGate(on_text, enabled=bool(tools))
+        _debug(
+            f"POST /api/chat model={self.model} messages={len(payload['messages'])} "
+            f"tools={len(payload.get('tools', []))} options={payload.get('options')}"
+        )
 
         try:
             with self._client.stream("POST", self.host + "/api/chat", json=payload, timeout=self.timeout) as resp:
@@ -189,6 +339,7 @@ class OllamaBackend(Backend):
                     line = line.strip()
                     if not line:
                         continue
+                    _debug(f"<< {line[:400]}")
                     try:
                         obj = json.loads(line)
                     except (json.JSONDecodeError, ValueError) as exc:
@@ -205,8 +356,7 @@ class OllamaBackend(Backend):
                         content = msg.get("content")
                         if isinstance(content, str) and content:
                             text_parts.append(content)
-                            if on_text:
-                                on_text(content)
+                            gate.feed(content)
                         thinking = msg.get("thinking")
                         if isinstance(thinking, str) and thinking:
                             thinking_parts.append(thinking)
@@ -242,6 +392,18 @@ class OllamaBackend(Backend):
             )
 
         text = "".join(text_parts)
+        if tools and not tool_calls:
+            # Petits modèles locaux : l'appel d'outil arrive parfois en texte
+            # (JSON nu, <tool_call>, bloc ```json) au lieu de message.tool_calls.
+            remainder, rescued = rescue_text_tool_calls(text, {t.name for t in tools})
+            if rescued:
+                _debug(f"appel(s) d'outil récupéré(s) depuis le texte : {[c['name'] for c in rescued]}")
+                for call in rescued:
+                    raw_tool_calls.append({"function": {"name": call["name"], "arguments": call["arguments"]}})
+                    tool_calls.append(ToolCall(id=_new_call_id(), name=call["name"], arguments=call["arguments"]))
+                text = remainder
+                gate.finish(replacement=remainder)
+        gate.finish()
         raw: dict[str, Any] = {"role": "assistant", "content": text}
         if thinking_parts:
             raw["thinking"] = "".join(thinking_parts)
