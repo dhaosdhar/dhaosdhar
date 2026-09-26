@@ -218,3 +218,22 @@ def test_token_bytes_and_merged_tokens() -> None:
     assert tok.token_bytes(tok.vocab_size) is None
     assert tok.encode("aaaa") != list(b"aaaa")
     assert tok.decode(tok.encode("aaaa")) == "aaaa"
+
+
+# ------------------------------------------------- régressions : substituts isolés
+@pytest.mark.parametrize("cls", [BPETokenizer, ByteTokenizer])
+def test_encode_tolerates_lone_surrogates(cls: type) -> None:
+    """``sys.argv`` décode un octet non UTF-8 en substitut (surrogateescape) :
+    ``encode`` doit restituer l'octet d'origine au lieu de lever UnicodeEncodeError."""
+    tok = cls()
+    ids = tok.encode("le \udcff chat")  # ce que sys.argv produit pour l'octet 0xFF
+    assert ids == [108, 101, 32, 255, 32, 99, 104, 97, 116]
+    assert tok.decode(ids) == "le � chat"
+
+
+def test_bpe_train_tolerates_lone_surrogates() -> None:
+    tok = BPETokenizer()
+    tok.train("ab\udcffcd " * 20, vocab_size=300)  # ne doit pas lever UnicodeEncodeError
+    assert tok.decode(tok.encode("ab\udcffcd")) == "ab�cd"
+    # Le texte Unicode valide garde un aller-retour exact.
+    assert tok.decode(tok.encode("été 😀")) == "été 😀"

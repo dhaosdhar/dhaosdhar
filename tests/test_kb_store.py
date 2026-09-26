@@ -173,3 +173,51 @@ def test_memory_store() -> None:
     s.create_base("x")
     assert s.stats()["db_bytes"] == 0 and s.stats()["bases"] == 1
     s.close()
+
+
+# ------------------------------------- régression : iter_document_texts en flux
+def test_iter_document_texts_streams_and_keeps_order(store: Store) -> None:
+    import threading
+    import tracemalloc
+
+    base = store.create_base("b")
+    other = store.create_base("a")
+    doc_len = 200_000
+    for i in range(50):
+        store.upsert_document(
+            base["id"], f"doc-{i:03d}", title=f"doc {i}", hash=f"h{i}", size=doc_len, text=chr(97 + i % 26) * doc_len
+        )
+    store.upsert_document(other["id"], "z", title="z", hash="hz", size=1, text="z")
+
+    gen = store.iter_document_texts([base["id"]])
+    tracemalloc.start()
+    first = next(gen)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert len(first[1]) == doc_len
+    # Un document à la fois, pas tout le corpus (~10 Mo) d'un bloc.
+    assert peak < 3 * doc_len
+
+    # Le verrou n'est pas tenu entre deux next() : un autre thread peut lire.
+    result: list = []
+
+    def reader() -> None:
+        result.append(store.get_base("b") is not None)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    t.join(timeout=5)
+    assert result == [True]
+    gen.close()
+
+    # Ordre (base_id, source) conservé, bases multiples.
+    ids = [d for d, _ in store.iter_document_texts([other["id"], base["id"]])]
+    expected = [
+        int(r["id"])
+        for r in store.conn.execute(
+            "SELECT id FROM documents WHERE base_id IN (?, ?) ORDER BY base_id, source",
+            (other["id"], base["id"]),
+        )
+    ]
+    assert ids == expected and len(ids) == 51
+    assert list(store.iter_document_texts([])) == []

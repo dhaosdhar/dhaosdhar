@@ -7,17 +7,22 @@ de contexte itérable.
 """
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import anthropic
+import httpx2
 import pytest
 
+from dhaos.agent.loop import ITERATION_LIMIT_NOTICE, Agent
 from dhaos.backends import get_backend
 from dhaos.backends.base import BackendError
 from dhaos.backends.claude import FALLBACK_BETA, ClaudeBackend
 from dhaos.config import Settings
+from dhaos.tools.base import ToolContext, ToolRegistry
 from dhaos.types import Message, ToolCall, ToolSpec
 
 # ---------------------------------------------------------------- doubles
@@ -37,12 +42,19 @@ def final_message(
     stop_details: Any = None,
     input_tokens: int = 100,
     output_tokens: int = 20,
+    cache_read_input_tokens: int | None = None,
+    cache_creation_input_tokens: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         content=list(blocks),
         stop_reason=stop_reason,
         stop_details=stop_details,
-        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+        ),
         model=model,
     )
 
@@ -321,7 +333,9 @@ def test_max_tokens_with_tool_use_drops_tool_calls(settings: Settings) -> None:
     assert resp.stop_reason == "max_tokens"
     assert resp.tool_calls == []
     assert resp.text == "partiel"
-    assert len(resp.raw) == 2  # les blocs restent rejouables
+    # Le texte reste rejouable ; le tool_use abandonné (jamais suivi d'un
+    # tool_result) est retiré de la charge brute.
+    assert resp.raw == [{"type": "text", "text": "partiel"}]
 
 
 def test_refusal_drops_tool_calls_and_annotates_text(settings: Settings) -> None:
@@ -370,7 +384,10 @@ def test_value_error_retries_then_succeeds(settings: Settings) -> None:
     resp = backend.chat([Message("user", "q")], on_text=texts.append)
     assert resp.text == "ok"
     assert len(messages.calls) == 3
-    assert texts == ["a", "ok"]
+    # Le texte du tour avorté ("a") diverge du tour réussi : il n'est pas
+    # concaténé silencieusement, un marqueur de réémission le sépare.
+    assert "".join(texts) == "a\n[réémission]\nok"
+    assert "".join(texts).endswith(resp.text)
 
 
 def test_value_error_gives_up_after_two_retries(settings: Settings) -> None:
@@ -441,8 +458,23 @@ def test_unrelated_exceptions_propagate(settings: Settings) -> None:
 
 @pytest.fixture
 def no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR"):
         monkeypatch.delenv(key, raising=False)
+
+
+def write_profile(config_dir: Path, profile: str = "default") -> None:
+    """Profil `ant auth login` minimal (configs/<p>.json + credentials/<p>.json)."""
+    (config_dir / "configs").mkdir(parents=True, exist_ok=True)
+    (config_dir / "credentials").mkdir(parents=True, exist_ok=True)
+    (config_dir / "configs" / f"{profile}.json").write_text(
+        json.dumps({"authentication": {"type": "user_oauth"}}), encoding="utf-8"
+    )
+    creds = config_dir / "credentials" / f"{profile}.json"
+    creds.write_text(
+        json.dumps({"access_token": "sk-ant-oat01-fake", "refresh_token": "r", "expires_at": 4102444800}),
+        encoding="utf-8",
+    )
+    creds.chmod(0o600)
 
 
 def test_healthcheck_without_credentials(settings: Settings, no_credentials: None) -> None:
@@ -464,7 +496,304 @@ def test_healthcheck_with_auth_token(settings: Settings, no_credentials: None, m
 
 
 def test_healthcheck_with_profile_dir(settings: Settings, no_credentials: None) -> None:
-    profile = os.path.join(os.environ["HOME"], ".config", "anthropic")
-    os.makedirs(profile)
+    profile = Path(os.environ["HOME"]) / ".config" / "anthropic"
+    write_profile(profile)
     hc = ClaudeBackend(settings).healthcheck()
     assert hc["ok"] is True and "ant auth login" in hc["detail"]
+    assert str(profile) in hc["detail"] and "`default`" in hc["detail"]
+
+
+# ---------------------------------------------------------------- régressions : rejeu après arrêt max_tokens / refusal
+
+
+def orphan_tool_uses(claude_messages: list[dict[str, Any]]) -> list[str]:
+    """Ids ``tool_use`` d'un message assistant non suivis d'un ``tool_result``
+    dans le message user immédiatement suivant (règle de l'API Messages)."""
+    orphans: list[str] = []
+    for i, msg in enumerate(claude_messages):
+        if msg["role"] != "assistant" or not isinstance(msg["content"], list):
+            continue
+        ids = [b["id"] for b in msg["content"] if b.get("type") == "tool_use"]
+        if not ids:
+            continue
+        nxt = claude_messages[i + 1] if i + 1 < len(claude_messages) else None
+        answered = set()
+        if nxt and nxt["role"] == "user" and isinstance(nxt["content"], list):
+            answered = {b.get("tool_use_id") for b in nxt["content"] if b.get("type") == "tool_result"}
+        orphans.extend(t for t in ids if t not in answered)
+    return orphans
+
+
+@pytest.mark.parametrize("api_stop", ["max_tokens", "model_context_window_exceeded", "refusal"])
+def test_dropped_tool_use_is_not_replayed(settings: Settings, api_stop: str) -> None:
+    final = final_message(
+        block(type="thinking", thinking="", signature="sig"),
+        block(type="text", text="Je lis"),
+        block(type="tool_use", id="toolu_1", name="read_file", input={"path": "/etc/pas"}),
+        stop_reason=api_stop,
+    )
+    backend, _ = make_backend(settings, FakeStream([], final))
+    resp = backend.chat([Message("user", "lis le fichier")])
+    assert resp.tool_calls == []
+    assert all(b["type"] != "tool_use" for b in resp.raw or [])
+    assert any(b["type"] == "text" for b in resp.raw)  # le texte reste rejoué tel quel
+
+    params = backend.build_params([Message("user", "q"), resp.to_assistant_message(), Message("user", "continue")])
+    assert orphan_tool_uses(params["messages"]) == []
+    assert params["messages"][-1] == {"role": "user", "content": "continue"}
+
+
+def test_dropped_tool_use_without_text_yields_no_raw(settings: Settings) -> None:
+    final = final_message(
+        block(type="thinking", thinking="", signature="sig"),
+        block(type="tool_use", id="toolu_1", name="write_file", input={"path": "a"}),
+        stop_reason="max_tokens",
+    )
+    backend, _ = make_backend(settings, FakeStream([], final))
+    resp = backend.chat([Message("user", "q")])
+    assert resp.raw is None and resp.text == ""
+    # Le message assistant vide est ignoré au rejeu : pas de tool_use orphelin.
+    out = ClaudeBackend.to_claude_messages([Message("user", "q"), resp.to_assistant_message(), Message("user", "suite")])
+    assert out == [{"role": "user", "content": "q"}, {"role": "user", "content": "suite"}]
+
+
+def test_agent_continues_after_max_tokens_with_tool_use(settings: Settings, ctx: ToolContext) -> None:
+    """Deux ``agent.run`` successifs (REPL chat) après un max_tokens avec tool_use :
+    le second appel capturé ne contient aucun tool_use orphelin."""
+    truncated = final_message(
+        block(type="text", text="Je lis"),
+        block(type="tool_use", id="toolu_1", name="read_file", input={"path": "/etc/pas"}),
+        stop_reason="max_tokens",
+    )
+    backend, messages = make_backend(
+        settings, FakeStream([], truncated), FakeStream([], final_message(block(type="text", text="ok")))
+    )
+    agent = Agent(settings, backend, ToolRegistry([]), ctx)
+    first = agent.run("lis le fichier")
+    assert first.stop_reason == "max_tokens" and first.tool_calls == 0
+    second = agent.run("continue")
+    assert second.stop_reason == "end_turn" and second.text == "ok"
+    assert len(messages.calls) == 2
+    assert orphan_tool_uses(messages.calls[1]["messages"]) == []
+
+
+# ---------------------------------------------------------------- régressions : clôture max_iterations avec historique d'outils
+
+
+def tool_history() -> list[Message]:
+    return [
+        Message("user", "fais"),
+        Message("assistant", "", tool_calls=[ToolCall("toolu_1", "read_file", {"path": "a"})],
+                raw=[{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a"}}]),
+        Message("tool", "contenu", tool_call_id="toolu_1", name="read_file"),
+        Message("user", ITERATION_LIMIT_NOTICE),
+    ]
+
+
+def test_closing_turn_keeps_tools_with_tool_choice_none(settings: Settings) -> None:
+    backend, messages = make_backend(
+        settings,
+        FakeStream([], final_message(block(type="tool_use", id="t", name="read_file", input={}), stop_reason="tool_use")),
+        FakeStream([], final_message(block(type="text", text="résumé"))),
+    )
+    backend.chat([Message("user", "fais")], tools=[TOOL])  # tour normal : outils transmis
+    resp = backend.chat(tool_history(), system="sys", tools=None)  # clôture max_iterations
+    assert resp.text == "résumé"
+    params = messages.calls[1]
+    assert params["tools"] == [ClaudeBackend._tool_to_claude(TOOL)]  # définitions rejouées
+    assert params["tool_choice"] == {"type": "none"}
+    assert "tool_choice" not in messages.calls[0]
+
+
+def test_build_params_defines_tools_whenever_history_has_tool_blocks(settings: Settings) -> None:
+    backend = ClaudeBackend(settings, client=fake_client())
+    params = backend.build_params(tool_history(), system="sys", tools=None)
+    assert "tools" in params and params["tool_choice"] == {"type": "none"}
+    assert [t["name"] for t in params["tools"]] == ["read_file"]  # déduit de l'historique
+    # Sans bloc d'outil, rien ne change.
+    plain = backend.build_params([Message("user", "q")], tools=None)
+    assert "tools" not in plain and "tool_choice" not in plain
+    # Avec des outils, pas de tool_choice.
+    with_tools = backend.build_params(tool_history(), tools=[TOOL])
+    assert with_tools["tools"] == [ClaudeBackend._tool_to_claude(TOOL)] and "tool_choice" not in with_tools
+
+
+# ---------------------------------------------------------------- régressions : erreur SSE mi-flux
+
+
+@pytest.mark.parametrize("err_type", ["overloaded_error", "api_error"])
+def test_mid_stream_error_event_is_server_error(settings: Settings, err_type: str) -> None:
+    body = {"type": "error", "error": {"type": err_type, "message": "Overloaded"}}
+    response = SimpleNamespace(status_code=200, headers={}, request=SimpleNamespace())
+    exc = anthropic.APIStatusError(str(body), response=response, body=body)  # type: ignore[arg-type]
+    backend, _ = make_backend(settings, FakeStream([SimpleNamespace(type="text", text="Bonjour"), exc]))
+    with pytest.raises(BackendError, match="erreur côté serveur") as info:
+        backend.chat([Message("user", "salut")])
+    text = str(info.value)
+    assert "refusée" not in text and "HTTP 200" not in text
+    assert err_type in text and "Overloaded" in text
+
+
+def test_mid_stream_rate_limit_event(settings: Settings) -> None:
+    body = {"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}
+    response = SimpleNamespace(status_code=200, headers={}, request=SimpleNamespace())
+    exc = anthropic.APIStatusError(str(body), response=response, body=body)  # type: ignore[arg-type]
+    backend, _ = make_backend(settings, FakeStream([exc]))
+    with pytest.raises(BackendError, match="limite de débit"):
+        backend.chat([Message("user", "salut")])
+
+
+def test_mid_stream_error_through_real_sdk(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chemin réel du SDK (httpx2.MockTransport → _streaming → _make_status_error)."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    sse = (
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message",'
+        '"role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"stop_sequence":null,'
+        '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Bonjour"}}\n\n'
+        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+    )
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=sse.encode())
+
+    client = anthropic.Anthropic(
+        api_key="sk-ant-test", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)), max_retries=0
+    )
+    backend = ClaudeBackend(settings, client=client)
+    texts: list[str] = []
+    with pytest.raises(BackendError, match="erreur côté serveur Anthropic \\(overloaded_error\\)") as info:
+        backend.chat([Message("user", "salut")], on_text=texts.append)
+    assert texts == ["Bonjour"]
+    assert "HTTP 200" not in str(info.value)
+
+
+# ---------------------------------------------------------------- régressions : réémission sans doublon
+
+
+def test_retry_does_not_replay_already_shown_prefix(settings: Settings) -> None:
+    backend, _ = make_backend(
+        settings,
+        FakeStream([SimpleNamespace(type="text", text="Voici "), ValueError("bad json")]),
+        FakeStream(
+            [SimpleNamespace(type="text", text="Voici "), SimpleNamespace(type="text", text="la suite")],
+            final_message(block(type="text", text="Voici la suite")),
+        ),
+    )
+    texts: list[str] = []
+    resp = backend.chat([Message("user", "q")], on_text=texts.append)
+    assert "".join(texts) == "Voici la suite"
+    assert resp.text == "Voici la suite"
+
+
+def test_retry_with_divergent_text_is_marked(settings: Settings) -> None:
+    backend, _ = make_backend(
+        settings,
+        FakeStream([SimpleNamespace(type="text", text="a"), ValueError("bad json")]),
+        FakeStream([SimpleNamespace(type="text", text="b")], final_message(block(type="text", text="b"))),
+    )
+    texts: list[str] = []
+    resp = backend.chat([Message("user", "q")], on_text=texts.append)
+    shown = "".join(texts)
+    assert shown != "ab" and "[réémission]" in shown
+    assert shown.endswith(resp.text)
+
+
+def test_retry_with_chunk_boundaries_shifted(settings: Settings) -> None:
+    """Le prolongement est calculé sur le texte cumulé, pas sur les morceaux."""
+    backend, _ = make_backend(
+        settings,
+        FakeStream([SimpleNamespace(type="text", text="ab"), SimpleNamespace(type="text", text="cd"), ValueError("x")]),
+        FakeStream(
+            [SimpleNamespace(type="text", text="a"), SimpleNamespace(type="text", text="bcde"), SimpleNamespace(type="text", text="f")],
+            final_message(block(type="text", text="abcdef")),
+        ),
+    )
+    texts: list[str] = []
+    resp = backend.chat([Message("user", "q")], on_text=texts.append)
+    assert "".join(texts) == "abcdef" == resp.text
+
+
+def test_retry_does_not_replay_thinking(settings: Settings) -> None:
+    backend, _ = make_backend(
+        settings,
+        FakeStream([SimpleNamespace(type="thinking", thinking="hmm "), ValueError("bad json")]),
+        FakeStream(
+            [SimpleNamespace(type="thinking", thinking="hmm "), SimpleNamespace(type="thinking", thinking="ok")],
+            final_message(block(type="thinking", thinking="hmm ok", signature="s"), block(type="text", text="r")),
+        ),
+    )
+    thoughts: list[str] = []
+    resp = backend.chat([Message("user", "q")], on_thinking=thoughts.append)
+    assert "".join(thoughts) == "hmm ok" == resp.thinking
+
+
+# ---------------------------------------------------------------- régressions : usage avec cache
+
+
+def test_usage_includes_cached_input_tokens(settings: Settings) -> None:
+    final = final_message(
+        block(type="text", text="x"),
+        input_tokens=12,
+        output_tokens=5,
+        cache_read_input_tokens=18000,
+        cache_creation_input_tokens=2000,
+    )
+    backend, messages = make_backend(settings, FakeStream([], final))
+    resp = backend.chat([Message("user", "q")])
+    assert messages.calls[0]["cache_control"] == {"type": "ephemeral"}
+    assert resp.usage.input_tokens == 20012 and resp.usage.output_tokens == 5
+
+
+def test_usage_cache_fields_none(settings: Settings) -> None:
+    final = final_message(block(type="text", text="x"), input_tokens=7, cache_read_input_tokens=None)
+    backend, _ = make_backend(settings, FakeStream([], final))
+    assert backend.chat([Message("user", "q")]).usage.input_tokens == 7
+
+
+# ---------------------------------------------------------------- régressions : healthcheck et profil du SDK
+
+
+def test_healthcheck_empty_profile_dir_is_not_ok(settings: Settings, no_credentials: None) -> None:
+    (Path(os.environ["HOME"]) / ".config" / "anthropic").mkdir(parents=True)
+    hc = ClaudeBackend(settings).healthcheck()
+    assert hc["ok"] is False and "ant auth login" in hc["detail"]
+
+
+def test_healthcheck_profile_via_config_dir(
+    settings: Settings, no_credentials: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_dir = tmp_path / "anthropic-cfg"
+    write_profile(config_dir)
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(config_dir))
+    hc = ClaudeBackend(settings).healthcheck()
+    assert hc["ok"] is True and str(config_dir) in hc["detail"]
+
+
+def test_healthcheck_named_profile(
+    settings: Settings, no_credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = Path(os.environ["HOME"]) / ".config" / "anthropic"
+    write_profile(config_dir, profile="dev")
+    monkeypatch.setenv("ANTHROPIC_PROFILE", "dev")
+    hc = ClaudeBackend(settings).healthcheck()
+    assert hc["ok"] is True and "`dev`" in hc["detail"]
+    # Un profil nommé absent est un diagnostic négatif, pas une exception.
+    monkeypatch.setenv("ANTHROPIC_PROFILE", "absent")
+    assert ClaudeBackend(settings).healthcheck()["ok"] is False
+
+
+# ---------------------------------------------------------------- régressions : absence d'identifiants
+
+
+def test_chat_without_credentials_raises_backend_error(settings: Settings, no_credentials: None) -> None:
+    backend = ClaudeBackend(settings)  # vrai client SDK, aucune méthode d'authentification
+    with pytest.raises(BackendError, match="clé API absente"):
+        backend.chat([Message("user", "bonjour")])
+
+
+def test_unrelated_type_error_propagates(settings: Settings) -> None:
+    backend, _ = make_backend(settings, TypeError("bug interne"))
+    with pytest.raises(TypeError, match="bug interne"):
+        backend.chat([Message("user", "q")])

@@ -64,7 +64,7 @@ systemd/           unité de service pour l'API
 | `grep` | `pattern` (regex), `root?`, `glob?`, `case_insensitive?`, `max_results?` | `check_read` |
 | `write_file` | `path`, `content`, `create_dirs?` | `check_write` (+ confirmation) ; sauvegarde ; journal |
 | `edit_file` | `path`, `old_string`, `new_string`, `replace_all?` | idem ; `old_string` doit être unique sauf `replace_all` |
-| `run_command` | `command`, `cwd?`, `timeout?` | `check_command` (+ confirmation) ; journal ; sortie tronquée |
+| `run_command` | `command`, `cwd?`, `timeout?` | `check_command` (+ confirmation) ; journal ; sortie tronquée. La liste blanche (`shell_auto_allow`) ne remplace pas `check_write` : une option qui fait écrire, supprimer ou exécuter (`find -exec/-delete/-fprint`, `sort -o`, `git log --output`, `tree -o`, `uniq IN OUT`, `pytest --basetemp`… cf. `DEFAULT_SHELL_UNSAFE_OPTIONS`) impose la confirmation, de même qu'un argument-chemin refusé par `check_read` (`cat ~/.ssh/id_rsa`, résolu depuis `cwd`) |
 | `web_search` | `query`, `max_results?` | provider `web.provider` |
 | `fetch_url` | `url`, `max_chars?` | http/https seulement ; pas d'adresses privées/localhost |
 | `kb_list` | — | — |

@@ -206,6 +206,50 @@ def test_metacharacters_refused(policy: AccessPolicy, command: str) -> None:
     assert not policy.is_auto_allowed(command)
 
 
+# Régression : `find` en liste blanche exécutait / supprimait sans confirmation.
+@pytest.mark.parametrize(
+    "command",
+    ["find . -exec cat {} +", "find . -execdir sh -c 'id' sh {} +", "find . -name x -delete",
+     "find . -fprintf /tmp/out '%p'", "find . -ok rm {} +", "find . -okdir rm {} +",
+     "find . -fprint /tmp/x", "find . -fprint0 /tmp/x", "find . -fls /tmp/x",
+     "find /home -maxdepth 0 -exec sh -c 'touch /home/pwned' sh {} +"],
+)
+def test_find_dangerous_actions_need_confirmation(settings: Settings, policy: AccessPolicy, command: str) -> None:
+    settings.tools.shell_policy = "ask"
+    assert policy.is_auto_allowed(command) is False
+    assert policy.check_command(command).needs_confirmation is True
+
+
+# Régression : options d'écriture des commandes en liste blanche (sort -o, git log
+# --output, tree -o, uniq IN OUT, pytest --basetemp) contournaient write_policy.
+@pytest.mark.parametrize(
+    "command",
+    ["sort -o /tmp/x /etc/hostname", "sort --output=/tmp/x /etc/hostname", "sort --output /tmp/x a",
+     "sort --out=/tmp/x a", "sort -o/tmp/x a", "sort -ro /tmp/x a", "sort -T /tmp/d a",
+     "git log --output=/tmp/x", "git log --output /tmp/x", "git log --out=/tmp/x",
+     "git show --output=/tmp/x HEAD", "git diff --output=/tmp/x", "tree -o /tmp/x",
+     "uniq in.txt /tmp/out.txt", "pytest --basetemp=/tmp/x", "python -m pytest --basetemp /tmp/x",
+     "python3 -m pytest --junitxml=/tmp/x.xml", "pytest -o cache_dir=/tmp/x", "pytest --log-file=/tmp/x"],
+)
+def test_whitelisted_commands_with_write_options_need_confirmation(
+    settings: Settings, policy: AccessPolicy, command: str
+) -> None:
+    settings.tools.shell_policy = "ask"
+    assert policy.is_auto_allowed(command) is False
+    assert policy.check_command(command).needs_confirmation is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["find . -name '*.py' -maxdepth 2", "find src -type f -newer x -print", "sort fichier.txt",
+     "sort -n -r -k2 fichier.txt", "sort --reverse fichier.txt", "git log --oneline -n 5 --stat",
+     "git show --stat HEAD", "git diff --stat HEAD~1", "tree -L 2 -a", "uniq -c fichier.txt",
+     "pytest tests/ -q -x", "python -m pytest -k foo --collect-only"],
+)
+def test_whitelisted_commands_without_write_options_stay_allowed(policy: AccessPolicy, command: str) -> None:
+    assert policy.is_auto_allowed(command) is True
+
+
 def test_invalid_shlex_and_empty(policy: AccessPolicy) -> None:
     assert not policy.is_auto_allowed("")
     assert not policy.is_auto_allowed("   ")
@@ -278,3 +322,90 @@ def test_journal_serializes_paths(tmp_path: Path) -> None:
     journal = Journal(tmp_path / "journal.jsonl")
     journal.record("write_file", path=tmp_path / "f.txt", backup=None)
     assert journal.tail()[0]["path"] == str(tmp_path / "f.txt")
+
+
+# ------------------------------------------------- commands : chemins protégés
+# Régression : les commandes en liste blanche (cat, head, grep…) lisaient les
+# chemins refusés par check_read (deny_patterns) sans confirmation.
+
+
+@pytest.fixture
+def secrets_home(tmp_path: Path, project_root: Path) -> Path:
+    home = Path(os.environ["HOME"])
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_rsa").write_text("PRIVATE-KEY-SENTINEL-A1\n", encoding="utf-8")
+    (home / ".aws").mkdir()
+    (home / ".aws" / "credentials").write_text("aws_secret_access_key = SENTINEL-C3\n", encoding="utf-8")
+    (project_root / ".env").write_text("SECRET=SENTINEL-D4\n", encoding="utf-8")
+    (project_root / "README.md").write_text("# lisible\n", encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["cat ~/.ssh/id_rsa", "cat {home}/.ssh/id_rsa", "head -c 40 ~/.ssh/id_rsa", "tail -n 5 {home}/.ssh/id_rsa",
+     "grep -r SENTINEL {home}/.aws", "grep -rl x {home}/.config/dhaos", "cat /proc/self/status",
+     "wc -l /etc/shadow", "tail .env", "cat {project}/.env", "grep --file=~/.ssh/id_rsa README.md",
+     "cat id_rsa", "ls -la ~/.ssh", "find ~/.ssh -type f"],
+)
+def test_auto_allow_respects_deny_patterns(
+    settings: Settings, policy: AccessPolicy, secrets_home: Path, project_root: Path, template: str
+) -> None:
+    settings.tools.shell_policy = "ask"
+    (project_root / "id_rsa").write_text("x", encoding="utf-8")
+    command = template.format(home=secrets_home, project=project_root)
+    assert not policy.is_auto_allowed(command)
+    d = policy.check_command(command)
+    assert d.allowed and d.needs_confirmation
+    assert "protégé" in d.reason and "confirmation" in d.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cat README.md", "grep -rn 'def main' .", "ls -la src", "git diff --stat HEAD~1", "head -n 3 /etc/hostname",
+     "grep -rn SENTINEL .", "cat absent.txt", "wc -l README.md"],
+)
+def test_auto_allow_keeps_ordinary_reads(
+    settings: Settings, policy: AccessPolicy, secrets_home: Path, command: str
+) -> None:
+    settings.tools.shell_policy = "ask"
+    assert policy.is_auto_allowed(command)
+    d = policy.check_command(command)
+    assert d.allowed and not d.needs_confirmation
+
+
+def test_auto_allow_respects_read_roots(settings: Settings, project_root: Path, tmp_path: Path) -> None:
+    settings.tools.read_roots = [project_root]
+    policy = AccessPolicy(settings)
+    assert policy.is_auto_allowed("cat README.md")
+    assert not policy.is_auto_allowed(f"cat {tmp_path}/outside.txt")
+    assert not policy.is_auto_allowed("ls /etc")
+
+
+def test_check_command_resolves_relative_paths_from_cwd(
+    settings: Settings, policy: AccessPolicy, secrets_home: Path
+) -> None:
+    settings.tools.shell_policy = "ask"
+    # Sans cwd, « id_rsa » est relatif au projet (inexistant ⇒ nom ordinaire) ;
+    # depuis ~/.ssh, il désigne la clé privée.
+    assert policy.is_auto_allowed("cat id_rsa")
+    d = policy.check_command("cat id_rsa", cwd=secrets_home / ".ssh")
+    assert d.needs_confirmation and "protégé" in d.reason
+    assert not policy.is_auto_allowed("cat id_rsa", cwd=secrets_home / ".ssh")
+    assert policy.check_command("cat README.md", cwd=policy.project_root).needs_confirmation is False
+
+
+def test_auto_allow_refusal_reasons(policy: AccessPolicy) -> None:
+    assert policy.auto_allow_refusal("git status") is None
+    assert "liste blanche" in (policy.auto_allow_refusal("git push") or "")
+    assert "métacaractère" in (policy.auto_allow_refusal("ls | wc") or "")
+    assert "vide" in (policy.auto_allow_refusal("   ") or "")
+    assert "mal formée" in (policy.auto_allow_refusal("cat 'x") or "")
+    assert "option" in (policy.auto_allow_refusal("find . -delete") or "")
+
+
+def test_env_dumps_are_not_auto_allowed(policy: AccessPolicy) -> None:
+    # L'environnement (même expurgé) n'est pas livré au modèle sans confirmation.
+    assert not policy.is_auto_allowed("printenv")
+    assert not policy.is_auto_allowed("printenv DATABASE_URL")
+    assert not policy.is_auto_allowed("env")

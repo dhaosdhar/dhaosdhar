@@ -17,6 +17,9 @@ jamais aux fusions.
 Aller-retour exact : ``decode(encode(texte)) == texte`` pour tout texte
 Unicode valide (accents, emoji, code). ``decode`` accepte des identifiants
 inconnus ou des séquences d'octets invalides (``errors="replace"``).
+``encode`` tolère les substituts isolés (``surrogateescape``, ce que
+produit ``sys.argv`` pour un octet non UTF-8) : ils sont encodés comme
+l'octet d'origine, que ``decode`` rend ensuite en U+FFFD.
 """
 from __future__ import annotations
 
@@ -186,7 +189,7 @@ class ByteTokenizer(_BaseTokenizer):
     kind = "bytes"
 
     def _encode_plain(self, text: str) -> list[int]:
-        return list(text.encode("utf-8"))
+        return list(text.encode("utf-8", errors="surrogateescape"))
 
     @classmethod
     def load(cls, path: str | Path) -> "ByteTokenizer":
@@ -253,7 +256,7 @@ class BPETokenizer(_BaseTokenizer):
     def _encode_plain(self, text: str) -> list[int]:
         ids: list[int] = []
         for m in PRETOKEN_RE.finditer(text):
-            ids.extend(self._encode_word(m.group().encode("utf-8")))
+            ids.extend(self._encode_word(m.group().encode("utf-8", errors="surrogateescape")))
         return ids
 
     # ------------------------------------------------------------- infos
@@ -292,7 +295,7 @@ class BPETokenizer(_BaseTokenizer):
         for is_special, part in _split_specials(text):
             if not is_special:
                 for m in PRETOKEN_RE.finditer(part):
-                    word_freqs[m.group().encode("utf-8")] += 1
+                    word_freqs[m.group().encode("utf-8", errors="surrogateescape")] += 1
         words: list[list[int]] = [list(w) for w in word_freqs]
         freqs: list[int] = list(word_freqs.values())
         _log(on_log, f"tokenizer BPE : {len(words)} mot(s) unique(s), objectif {target} fusion(s)")

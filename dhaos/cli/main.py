@@ -12,17 +12,19 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import tomli_w
 import typer
 from pydantic import ValidationError
 from rich.markup import escape
 
 from .. import __version__
 from ..backends import BACKEND_NAMES, get_backend
-from ..config import Settings, default_config_path
+from ..config import ENV_PREFIX, Settings, default_config_path, env_overrides
 from ..policy import Confirmer, Journal, auto_confirm
 from ..runtime import build_runtime
 from ..types import ToolCall
@@ -648,7 +650,11 @@ def kb_export(
 ) -> None:
     """Exporter les documents d'une base en JSONL."""
     with _KB(_settings(ctx)) as kb:
-        n = kb.export(name, output)
+        try:
+            n = kb.export(name, output)
+        except OSError as e:
+            fail(f"export impossible vers {output} : {e}")
+            return
         success(f"{n} document(s) exporté(s) vers {output}")
 
 
@@ -675,11 +681,49 @@ def _has_key(data: Any, dotted: str) -> bool:
     return True
 
 
+def _get_key(data: Any, dotted: str) -> Any:
+    node = data
+    for part in dotted.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
+def _put_key(data: dict[str, Any], dotted: str, value: Any) -> None:
+    """Écrit ``value`` sous la clé pointée ; ``None`` retire la clé (et les
+    sections devenues vides)."""
+    parts = dotted.split(".")
+    if value is None:
+        chain: list[dict[str, Any]] = [data]
+        for part in parts[:-1]:
+            child = chain[-1].get(part)
+            if not isinstance(child, dict):
+                return
+            chain.append(child)
+        chain[-1].pop(parts[-1], None)
+        for parent, part in zip(reversed(chain[:-1]), reversed(parts[:-1])):
+            if not parent.get(part):
+                parent.pop(part, None)
+        return
+    node = data
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = node[part] = {}
+        node = child
+    node[parts[-1]] = value
+
+
+def _env_name(dotted: str) -> str:
+    return ENV_PREFIX + "__".join(part.upper() for part in dotted.split("."))
+
+
 @config_app.command("show")
 def config_show(ctx: typer.Context) -> None:
     """Afficher la configuration effective (secrets masqués)."""
     settings = _settings(ctx)
-    note(f"# fichier : {_config_path(settings)}")
+    # Écrit directement sur stdout (pas via la console rich, qui replierait la
+    # ligne hors TTY) pour que la sortie redirigée reste du TOML valide.
+    sys.stdout.write(f"# fichier : {_config_path(settings)}\n")
     sys.stdout.write(_masked(settings).to_toml())
     sys.stdout.flush()
 
@@ -715,28 +759,42 @@ def config_set(
     key: str = typer.Argument(..., help="Clé pointée, ex. backends.default"),
     value: str = typer.Argument(..., help="Valeur (JSON si possible, sinon chaîne)."),
 ) -> None:
-    """Modifier une clé et enregistrer le fichier."""
-    settings = _settings(ctx)
+    """Modifier une clé et enregistrer le fichier.
+
+    Seul le contenu du fichier (plus la clé modifiée) est réécrit : les
+    surcharges d'environnement (``DHAOS__…``, y compris les secrets),
+    ``--project`` et les chemins calculés (XDG) ne sont jamais figés dedans.
+    """
     key = key.strip()
-    if not _has_key(settings.model_dump(mode="json", exclude={"source_path"}), key):
+    path = _config_path(_settings(ctx))
+    try:
+        stored: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        base = Settings.model_validate(stored)
+    except (OSError, ValueError, ValidationError) as e:
+        fail(f"configuration illisible : {path} : {e}")
+        return
+    if not _has_key(base.model_dump(mode="json", exclude={"source_path"}), key):
         fail(f"clé inconnue : {key}")
         return
     try:
-        new = settings.with_override(key, value)
+        new = base.with_override(key, value)
     except ValidationError as e:
         first = e.errors()[0] if e.errors() else {}
         fail(f"valeur invalide pour {key} : {first.get('msg', e)}")
         return
+    node = _get_key(new.model_dump(mode="json", exclude_none=True, exclude={"source_path"}), key)
+    _put_key(stored, key, node)
     try:
-        path = new.save()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(tomli_w.dumps(stored), encoding="utf-8")
     except OSError as e:
         fail(f"enregistrement impossible : {e}")
         return
-    node: Any = new.model_dump(mode="json")
-    for part in key.split("."):
-        node = node.get(part) if isinstance(node, dict) else None
     shown = MASK if key in SECRET_KEYS and node else ui.render_scalar(node)
     success(f"{key} = {shown} (enregistré dans {path})")
+    if _has_key(env_overrides(), key):
+        warn(f"la variable d'environnement {_env_name(key)} surcharge cette clé : la valeur enregistrée "
+             "ne sera effective qu'une fois cette variable retirée.")
 
 
 # ==================================================================== backends
@@ -859,6 +917,8 @@ def serve(
     settings = _settings(ctx)
     host = host or settings.api.host
     port = port or settings.api.port
+    # L'application dérive ses hôtes acceptés de api.host : refléter l'option.
+    settings.api.host, settings.api.port = host, port
     try:
         import uvicorn
 
@@ -869,11 +929,17 @@ def serve(
         fail(f"API indisponible : {e}")
         return
     note(f"dhaos API sur http://{host}:{port}")
+    state = getattr(application, "state", None)
+    if getattr(state, "token_generated", False):
+        note(f"jeton d'accès (api.token absent) : {state.token}")
     uvicorn.run(application, host=host, port=port)
 
 
 # ======================================================================= train
 _TRAIN_ERRORS = (ImportError, AttributeError, NotImplementedError)
+# Erreurs « métier » signalées par le module d'entraînement (corpus vide,
+# paramètre invalide, modèle incomplet, dépendance absente, écriture impossible).
+_TRAIN_USER_ERRORS = (ValueError, OSError, RuntimeError)
 
 
 def _train_log(line: Any) -> None:
@@ -884,16 +950,24 @@ def _train_log(line: Any) -> None:
 def train_dataset(
     ctx: typer.Context,
     out: Path | None = typer.Option(None, "--out", help="Fichier JSONL de sortie.", dir_okay=False, resolve_path=True),
-    bases: list[str] | None = typer.Option(None, "--base", "-b", help="Bases de savoir à inclure."),
+    bases: list[str] | None = typer.Option(
+        None, "--base", "-b", hidden=True,
+        help="Sans effet (conservé pour compatibilité) : les bases alimentent `train corpus`.",
+    ),
 ) -> None:
     """Construire un jeu de données SFT (JSONL) à partir des sessions."""
     settings = _settings(ctx)
+    if bases:
+        warn("--base est sans effet pour le jeu SFT (les bases de savoir alimentent `train corpus`).")
     try:
         from ..train import dataset as dataset_mod
 
-        report = dataset_mod.build_sft_dataset(settings, out_path=out, bases=list(bases) if bases else None)
+        report = dataset_mod.build_sft_dataset(settings, out_path=out)
     except _TRAIN_ERRORS as e:
         fail(f"module d'entraînement indisponible : {e}")
+        return
+    except _TRAIN_USER_ERRORS as e:
+        fail(f"jeu de données impossible : {e}")
         return
     console.print(escape(str(report.summary())), highlight=False)
     success(f"Jeu de données : {report.path} ({report.n_examples} exemple(s), {report.n_sessions_skipped} session(s) ignorée(s))")
@@ -908,11 +982,15 @@ def train_corpus(
     """Assembler un corpus texte depuis les bases de savoir."""
     settings = _settings(ctx)
     try:
+        from ..kb.manager import KnowledgeError
         from ..train import dataset as dataset_mod
 
         path = dataset_mod.build_corpus(settings, out_path=out, bases=list(bases) if bases else None)
     except _TRAIN_ERRORS as e:
         fail(f"module d'entraînement indisponible : {e}")
+        return
+    except (*_TRAIN_USER_ERRORS, KnowledgeError) as e:
+        fail(f"corpus impossible : {e}")
         return
     success(f"Corpus écrit : {path}")
 
@@ -929,6 +1007,7 @@ def train_nano_cmd(
     block_size: int | None = typer.Option(None, "--block-size", min=1),
     batch_size: int | None = typer.Option(None, "--batch-size", min=1),
     lr: float | None = typer.Option(None, "--lr", help="Taux d'apprentissage."),
+    force: bool = typer.Option(False, "--force", help="Écraser un modèle existant du même nom."),
 ) -> None:
     """Entraîner le modèle nano (GPT minimal, pédagogique) sur un corpus."""
     settings = _settings(ctx)
@@ -943,9 +1022,14 @@ def train_nano_cmd(
     try:
         from ..train.nano import train as nano_train
 
-        result = nano_train.train_nano(settings, corpus, name=name, overrides=overrides, on_log=_train_log)
+        result = nano_train.train_nano(
+            settings, corpus, name=name, overrides=overrides, on_log=_train_log, overwrite=force
+        )
     except _TRAIN_ERRORS as e:
         fail(f"module nano indisponible : {e}")
+        return
+    except _TRAIN_USER_ERRORS as e:
+        fail(f"entraînement impossible : {e}")
         return
     console.print(escape(str(result.summary())), highlight=False)
     success(f"Modèle enregistré dans {result.out_dir} (perte finale {result.final_loss:.4f})")
@@ -967,6 +1051,9 @@ def train_sample(
     except _TRAIN_ERRORS as e:
         fail(f"module nano indisponible : {e}")
         return
+    except _TRAIN_USER_ERRORS as e:
+        fail(f"génération impossible : {e}")
+        return
     sys.stdout.write(str(text) + "\n")
     sys.stdout.flush()
 
@@ -977,10 +1064,13 @@ def train_lora(
     dataset: Path = typer.Argument(..., help="Jeu de données SFT (JSONL).", exists=True, dir_okay=False, resolve_path=True),
     out: Path | None = typer.Option(None, "--out", help="Dossier de sortie.", file_okay=False, resolve_path=True),
     base_model: str | None = typer.Option(None, "--base-model", help="Modèle de base HF."),
-    epochs: float | None = typer.Option(None, "--epochs", min=0.0),
+    epochs: float | None = typer.Option(None, "--epochs", min=0.0, help="Nombre d'époques (> 0)."),
 ) -> None:
     """Fine-tuning LoRA d'un modèle ouvert sur les traces (dépendances optionnelles)."""
     settings = _settings(ctx)
+    if epochs is not None and epochs <= 0:
+        fail("--epochs doit être strictement positif")
+        return
     overrides = {k: v for k, v in {"base_model": base_model, "epochs": epochs}.items() if v is not None}
     try:
         from ..train import finetune
@@ -992,6 +1082,9 @@ def train_lora(
         path = finetune.run_finetune(settings, dataset, out_dir=out, overrides=overrides, on_log=_train_log)
     except _TRAIN_ERRORS as e:
         fail(f"module de fine-tuning indisponible : {e}")
+        return
+    except _TRAIN_USER_ERRORS as e:
+        fail(f"fine-tuning impossible : {e}")
         return
     success(f"Adaptateur LoRA enregistré dans {path}")
 

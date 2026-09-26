@@ -57,6 +57,18 @@ def parse_sse(text: str) -> list[tuple[str, Any]]:
     return events
 
 
+LOCAL_BASE_URL = "http://127.0.0.1"
+
+
+def local_client(app: Any, *, raise_server_exceptions: bool = True) -> TestClient:
+    """Client de test local (``Host: 127.0.0.1``) portant le jeton de l'application
+    (``api.token`` ou jeton généré) — le comportement par défaut d'un client
+    légitime ; les tests d'authentification retirent l'en-tête explicitement."""
+    client = TestClient(app, base_url=LOCAL_BASE_URL, raise_server_exceptions=raise_server_exceptions)
+    client.headers["Authorization"] = f"Bearer {app.state.token}"
+    return client
+
+
 def make_client(
     settings: Settings,
     responses: list[str | ChatResponse] | None = None,
@@ -68,8 +80,12 @@ def make_client(
 
     factory = None if backend_factory is not None else BackendFactory(responses)
     app = create_app(settings, backend_factory=backend_factory or factory, kb_factory=KnowledgeManager)
-    client = TestClient(app, raise_server_exceptions=raise_server_exceptions)
-    return client, factory
+    return local_client(app, raise_server_exceptions=raise_server_exceptions), factory
+
+
+def without_auth(client: TestClient) -> dict[str, str]:
+    """En-têtes annulant le jeton porté par défaut par ``local_client``."""
+    return {"Authorization": ""}
 
 
 @pytest.fixture
@@ -111,6 +127,39 @@ def test_health_survives_backend_failure(settings: Settings) -> None:
     assert "injoignable" in body["backend"]["health"]["detail"]
 
 
+def test_health_without_token_is_minimal(settings: Settings) -> None:
+    """Régression : ``/health`` sans jeton ne construit aucun backend (aucun
+    appel sortant) et ne révèle ni hôte, ni modèles, ni message d'erreur."""
+    settings.api.token = "secret"
+    client, factory = make_client(settings)
+    with client:
+        client.post("/kb", json={"name": "dev"})
+        r = client.get("/health", headers=without_auth(client))
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok" and body["version"] == __version__
+        assert body["backend"] == {"name": settings.backends.default, "model": "", "health": {}}
+        assert body["kb"] == {"bases": 0, "documents": 0, "chunks": 0}
+        assert factory.calls == []  # aucun backend construit
+        r = client.get("/health", headers={"Authorization": "Bearer mauvais"})
+        assert r.status_code == 200 and r.json()["backend"]["health"] == {} and factory.calls == []
+        # Avec le jeton : détail complet.
+        r = client.get("/health", headers={"Authorization": "Bearer secret"})
+        body = r.json()
+        assert body["backend"]["health"]["ok"] is True and body["backend"]["model"] == "fake-model"
+        assert body["kb"]["bases"] == 1
+        assert factory.calls == [(None, None)]
+
+
+def test_health_generated_token_gives_full_detail(api) -> None:
+    """Sans ``api.token`` configuré, le jeton généré donne le détail complet
+    et son absence l'état minimal."""
+    client, factory = api
+    assert client.get("/health").json()["backend"]["health"]["ok"] is True
+    assert client.get("/health", headers=without_auth(client)).json()["backend"]["health"] == {}
+    assert factory.calls == [(None, None)]
+
+
 def test_kb_closed_at_shutdown(settings: Settings) -> None:
     client, _ = make_client(settings)
     app = client.app
@@ -125,9 +174,11 @@ def test_kb_closed_at_shutdown(settings: Settings) -> None:
 def test_auth_required_when_token_set(settings: Settings) -> None:
     settings.api.token = "s3cret"
     client, _ = make_client(settings)
+    assert client.app.state.token == "s3cret" and client.app.state.token_generated is False
     with client:
-        assert client.get("/health").status_code == 200
-        r = client.get("/kb")
+        bare = without_auth(client)
+        assert client.get("/health", headers=bare).status_code == 200
+        r = client.get("/kb", headers=bare)
         assert r.status_code == 401
         assert "detail" in r.json()
         assert r.headers.get("www-authenticate") == "Bearer"
@@ -136,13 +187,137 @@ def test_auth_required_when_token_set(settings: Settings) -> None:
         assert client.get("/config", headers={"Authorization": "bearer s3cret"}).status_code == 200
         r = client.get("/kb", headers={"Authorization": "Bearer s3cret"})
         assert r.status_code == 200 and r.json() == []
-        r = client.post("/chat", json={"message": "x", "stream": False})
+        r = client.post("/chat", json={"message": "x", "stream": False}, headers=bare)
         assert r.status_code == 401
 
 
-def test_no_auth_without_token(api) -> None:
-    client, _ = api
-    assert client.get("/kb").status_code == 200
+def test_auth_non_ascii_header_is_401(settings: Settings) -> None:
+    """Régression : un octet non ASCII dans l'en-tête ne doit pas produire un
+    500 (``compare_digest`` refuse les ``str`` non ASCII) mais un 401."""
+    settings.api.token = "s3cret"
+    client, _ = make_client(settings, raise_server_exceptions=False)
+    with client:
+        for header in (b"Bearer \xe9s3cret", b"Bearer s3cret\xc3\xa9", "Bearer s3crét".encode("latin-1")):
+            r = client.get("/kb", headers={"Authorization": header})
+            assert r.status_code == 401, header
+            assert r.headers.get("www-authenticate") == "Bearer"
+            assert "erreur interne" not in r.text
+        assert client.get("/kb", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+
+
+def test_api_requires_token_by_default(settings: Settings) -> None:
+    """Régression : sans ``api.token``, un jeton aléatoire est généré ; rien
+    ne passe sans lui (sauf l'état minimal de ``/health``)."""
+    assert settings.api.token is None
+    client, _ = make_client(settings)
+    app = client.app
+    token = app.state.token
+    assert app.state.token_generated is True
+    assert isinstance(token, str) and len(token) >= 32
+    assert settings.api.token is None  # la configuration n'est pas modifiée
+    with client:
+        bare = without_auth(client)
+        assert client.get("/config", headers=bare).status_code == 401
+        assert client.get("/kb", headers=bare).status_code == 401
+        assert client.get("/sessions", headers=bare).status_code == 401
+        r = client.post("/chat", json={"message": "x", "stream": False}, headers=bare)
+        assert r.status_code == 401 and r.headers.get("www-authenticate") == "Bearer"
+        assert client.get("/health", headers=bare).status_code == 200
+        assert client.get("/config", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+        assert client.get("/config").json()["api"]["token"] is None  # jamais renvoyé par /config
+        assert token not in client.get("/config").text
+    # Deux applications ne partagent pas le même jeton.
+    other, _ = make_client(settings)
+    assert other.app.state.token != token
+
+
+def test_api_rejects_foreign_host(settings: Settings) -> None:
+    """Régression : un en-tête ``Host`` inattendu (DNS rebinding) ⇒ 400, même
+    avec le jeton et même sur ``/health``."""
+    settings.api.token = "s3cret"
+    client, _ = make_client(settings)
+    with client:
+        for host in ("evil.example.com", "evil.example.com:8642", ""):
+            r = client.get("/config", headers={"Host": host})
+            assert r.status_code == 400, host
+            assert "Host" in r.json()["detail"]
+            assert client.get("/health", headers={"Host": host}).status_code == 400
+        for host in ("127.0.0.1", "127.0.0.1:8642", "localhost", "LOCALHOST:1", "[::1]:8642", "[::1]"):
+            assert client.get("/config", headers={"Host": host}).status_code == 200, host
+        assert client.get("/health", headers={"Host": "localhost:8642"}).status_code == 200
+
+
+def test_api_allowed_hosts_setting(settings: Settings) -> None:
+    settings.api.host = "0.0.0.0"
+    settings.api.allowed_hosts = ["api.exemple.local"]
+    client, _ = make_client(settings)
+    with client:
+        assert client.get("/kb", headers={"Host": "api.exemple.local:9000"}).status_code == 200
+        assert client.get("/kb", headers={"Host": "127.0.0.1"}).status_code == 400
+    settings.api.allowed_hosts = ["*"]
+    client, _ = make_client(settings)
+    with client:
+        assert client.get("/kb", headers={"Host": "n-importe-quoi.example"}).status_code == 200
+
+
+def test_api_rejects_foreign_origin(settings: Settings) -> None:
+    """Régression : un en-tête ``Origin`` non listé ⇒ 403 (aucun client
+    navigateur par défaut) ; sans ``Origin`` la requête passe."""
+    settings.api.token = "s3cret"
+    client, _ = make_client(settings)
+    with client:
+        r = client.post("/chat", json={"message": "x", "stream": False}, headers={"Origin": "http://evil.example.com"})
+        assert r.status_code == 403
+        assert "origine" in r.json()["detail"]
+        assert client.get("/kb", headers={"Origin": "http://127.0.0.1:8642"}).status_code == 403
+        assert client.get("/kb", headers={"Origin": "null"}).status_code == 403
+        assert client.get("/kb").status_code == 200
+        assert client.get("/sessions").json() == []  # aucune session créée par le /chat refusé
+    settings.api.allowed_origins = ["http://localhost:3000/"]
+    client, _ = make_client(settings)
+    with client:
+        assert client.get("/kb", headers={"Origin": "http://LOCALHOST:3000"}).status_code == 200
+        assert client.get("/kb", headers={"Origin": "http://localhost:3001"}).status_code == 403
+
+
+def test_chat_needs_token_to_write_project(settings: Settings, project_root: Path) -> None:
+    """Régression : un ``/chat`` piloté depuis un hôte tiers et sans jeton ne
+    doit ni écrire dans le projet, ni exécuter de commande."""
+    target = project_root / "pwned.txt"
+    responses: list[str | ChatResponse] = [
+        tool_response(tool_call("write_file", "c1", path=str(target), content="écrit via l'API")),
+        tool_response(tool_call("run_command", "c2", command="echo commande-executee")),
+        "fini",
+    ]
+    client, factory = make_client(settings, responses)
+    with client:
+        evil = {"Host": "evil.example.com", "Origin": "http://evil.example.com", "Authorization": ""}
+        assert client.post("/chat", json={"message": "x", "stream": False}, headers=evil).status_code == 400
+        evil.pop("Host")
+        assert client.post("/chat", json={"message": "x", "stream": False}, headers=evil).status_code == 403
+        evil.pop("Origin")
+        assert client.post("/chat", json={"message": "x", "stream": False}, headers=evil).status_code == 401
+        assert not target.exists()
+        assert factory.calls == [] and client.get("/sessions").json() == []
+        # Le client légitime (jeton généré, hôte local) peut, lui, écrire dans le projet.
+        r = client.post("/chat", json={"message": "x", "stream": False})
+        assert r.status_code == 200 and r.json()["tool_calls"] == 2
+        assert target.read_text(encoding="utf-8") == "écrit via l'API"
+
+
+def test_host_guard_helpers() -> None:
+    from dhaos.api.server import allowed_hosts_for, host_name, normalize_origin
+
+    assert host_name("Example.COM:8642") == "example.com"
+    assert host_name("[::1]:8642") == "::1" and host_name("[::1]") == "::1"
+    assert host_name("127.0.0.1") == "127.0.0.1" and host_name("") == ""
+    assert normalize_origin("HTTP://Localhost:3000/") == "http://localhost:3000"
+    s = Settings()
+    assert allowed_hosts_for(s) == {"localhost", "127.0.0.1", "::1"}
+    s.api.host = "192.168.1.10"
+    assert "192.168.1.10" in allowed_hosts_for(s)
+    s.api.allowed_hosts = ["Proxy.Local:443"]
+    assert allowed_hosts_for(s) == {"proxy.local"}
 
 
 # ------------------------------------------------------------------ config
@@ -166,8 +341,9 @@ def test_config_masks_secrets(settings: Settings) -> None:
 
 def test_config_unset_secret_stays_null(api) -> None:
     client, _ = api
-    body = client.get("/config").json()
-    assert body["api"]["token"] is None
+    r = client.get("/config")
+    assert r.json()["api"]["token"] is None
+    assert client.app.state.token not in r.text
 
 
 # ---------------------------------------------------------------------- kb
@@ -283,6 +459,11 @@ def test_kb_documents_ingest_and_remove(api, settings: Settings, project_root: P
 
     assert client.post("/kb/absente/documents", json={"sources": ["x"]}).status_code == 404
     assert client.post("/kb/docs/documents", json={"sources": []}).status_code == 422
+    # Un dossier dont le nom est protégé n'est pas parcouru.
+    (project_root / ".env").mkdir()
+    (project_root / ".env" / "config").write_text("SECRET=1", encoding="utf-8")
+    report = client.post("/kb/docs/documents", json={"sources": [str(project_root / ".env")]}).json()
+    assert report["failed"] == 1 and report["added"] == 0 and "protégé" in report["errors"][0]
 
     r = client.request("DELETE", "/kb/docs/documents", json={"source": str(readme)})
     assert r.status_code == 200 and r.json() == {"removed": True}
@@ -292,6 +473,58 @@ def test_kb_documents_ingest_and_remove(api, settings: Settings, project_root: P
     assert r.status_code == 200 and r.json() == {"removed": True}
     assert client.delete("/kb/docs/documents").status_code == 422
     assert client.get("/kb/docs").json()["n_docs"] == 0
+
+
+def test_kb_add_folder_respects_deny_patterns(api, settings: Settings, project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Régression : les fichiers d'un dossier ingéré passent chacun par
+    ``check_read`` (motifs de nom ``.env``, ``id_rsa``, ``*.pem`` et de chemin
+    ``~/.ssh/**``) ; ils ne sont ni lus, ni indexés, ni cherchables."""
+    from dhaos.kb import manager as manager_mod
+
+    client, _ = api
+    client.post("/kb", json={"name": "docs"})
+    docs = project_root / "docs"
+    (docs / ".ssh").mkdir(parents=True)
+    (docs / "notes.txt").write_text("Le déploiement passe par systemd.\n", encoding="utf-8")
+    (docs / ".env").write_text("SECRET_TOKEN=MARQUEUR_DOTENV\n", encoding="utf-8")
+    (docs / ".ssh" / "id_rsa").write_text("-----BEGIN KEY----- MARQUEUR_ID_RSA\n", encoding="utf-8")
+    (docs / "cert.pem").write_text("MARQUEUR_PEM\n", encoding="utf-8")
+    home = Path(settings.resolve_project_root()).parent / "home"  # HOME du fixture
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_ed25519").write_text("MARQUEUR_HOME_SSH\n", encoding="utf-8")
+    (home / "lisible.txt").write_text("texte lisible\n", encoding="utf-8")
+
+    # Les fichiers refusés ne sont jamais ouverts par le gestionnaire.
+    original = manager_mod.KnowledgeManager._ingest_file
+    opened: list[str] = []
+
+    def spy(self, base_row, path, report, on_progress):  # type: ignore[no-untyped-def]
+        opened.append(str(path))
+        return original(self, base_row, path, report, on_progress)
+
+    monkeypatch.setattr(manager_mod.KnowledgeManager, "_ingest_file", spy)
+
+    r = client.post("/kb/docs/documents", json={"sources": [str(docs)], "recursive": True})
+    assert r.status_code == 200, r.text
+    report = r.json()
+    assert report["added"] == 1 and report["failed"] == 3, report
+    assert len(report["errors"]) == 3 and all("protégé" in e for e in report["errors"])
+    assert opened == [str(docs / "notes.txt")]
+    sources = [d["source"] for d in client.get("/kb/docs").json()["documents"]]
+    assert sources == [str(docs / "notes.txt")]
+    for marker in ("MARQUEUR_ID_RSA", "MARQUEUR_DOTENV", "MARQUEUR_PEM"):
+        assert client.post("/kb/search", json={"query": marker, "mode": "keyword"}).json() == []
+
+    # Motif de chemin (~/.ssh/**) : le HOME entier est ingérable, pas la clé.
+    report = client.post("/kb/docs/documents", json={"sources": [str(home)], "recursive": True}).json()
+    assert report["added"] == 1 and report["failed"] == 1 and "protégé" in report["errors"][0]
+    assert client.post("/kb/search", json={"query": "MARQUEUR_HOME_SSH", "mode": "keyword"}).json() == []
+    assert str(home / ".ssh" / "id_ed25519") not in opened
+    # Non récursif : seuls les fichiers du premier niveau.
+    (docs / "sous").mkdir()
+    (docs / "sous" / "autre.txt").write_text("profond\n", encoding="utf-8")
+    report = client.post("/kb/docs/documents", json={"sources": [str(docs)], "recursive": False}).json()
+    assert report["added"] == 0 and report["skipped"] == 1 and report["failed"] == 2
 
 
 def test_kb_stats(api) -> None:
@@ -374,7 +607,7 @@ def test_chat_unknown_backend(settings: Settings) -> None:
             raise ValueError(f"backend inconnu : {name!r}")
         return FakeBackend(["ok"])
 
-    with TestClient(create_app(settings, backend_factory=factory, kb_factory=KnowledgeManager)) as client:
+    with local_client(create_app(settings, backend_factory=factory, kb_factory=KnowledgeManager)) as client:
         r = client.post("/chat", json={"message": "x", "backend": "nope", "stream": False})
         assert r.status_code == 400
         assert "backend" in r.json()["detail"]
@@ -513,6 +746,75 @@ def test_chat_never_confirms_by_default(api, settings: Settings, monkeypatch: py
     assert captured["session"].id == client.get("/sessions").json()[0]["id"]
 
 
+def test_chat_failure_before_run_leaves_no_session(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Régression : si ``build_runtime`` échoue, la session créée pour ce tour
+    (vide) est supprimée ; aucun fichier JSONL orphelin, ``/sessions`` vide."""
+    from dhaos.api import server as api_server
+
+    def broken(settings: Settings, **kw: Any) -> Any:
+        raise RuntimeError("assemblage impossible")
+
+    monkeypatch.setattr(api_server, "build_runtime", broken)
+    client, _ = make_client(settings, ["ok"], raise_server_exceptions=False)
+    with client:
+        r = client.post("/chat", json={"message": "x", "stream": False})
+        assert r.status_code == 500 and "assemblage" in r.json()["detail"]
+        r = client.post("/chat", json={"message": "x", "stream": True})
+        assert r.status_code == 500
+        assert list(Path(settings.sessions_dir).glob("*.jsonl")) == []
+        assert client.get("/sessions").json() == []
+        assert not client.app.state.session_locks._busy
+        # Une session existante n'est jamais supprimée, même vide.
+        existing = SessionStore(settings).create()
+        r = client.post("/chat", json={"message": "x", "stream": False, "session_id": existing.id})
+        assert r.status_code == 500
+        assert [i["id"] for i in client.get("/sessions").json()] == [existing.id]
+
+
+def test_chat_crash_leaves_no_empty_session(settings: Settings) -> None:
+    """Régression : un backend qui lève (hors ``BackendError``) ne laisse pas
+    de session vide (``n_messages == 0``) dans le magasin."""
+
+    class Crashing(Backend):
+        name = "crash"
+        model = "none"
+
+        def chat(self, messages, *, system="", tools=None, on_text=None, on_thinking=None) -> ChatResponse:
+            raise ValueError("panne")
+
+    client, _ = make_client(settings, backend_factory=lambda s, n, m: Crashing(), raise_server_exceptions=False)
+    with client:
+        assert client.post("/chat", json={"message": "x", "stream": False}).status_code == 500
+        events = parse_sse(client.post("/chat", json={"message": "y"}).text)
+        assert [e for e, _ in events] == ["error"]
+        infos = client.get("/sessions").json()
+        assert all(i["n_messages"] >= 1 for i in infos)
+        files = list(Path(settings.sessions_dir).glob("*.jsonl"))
+        assert len(files) == len(infos)
+
+
+def test_chat_agent_crash_before_any_message_leaves_no_session(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Régression : ``Agent.run`` qui lève avant d'enregistrer le moindre
+    message (JSON et SSE) ⇒ la session créée pour ce tour est supprimée."""
+    from dhaos.agent.loop import Agent
+
+    def boom(self, message, **kw):  # type: ignore[no-untyped-def]
+        raise RuntimeError("panne immédiate")
+
+    monkeypatch.setattr(Agent, "run", boom)
+    client, _ = make_client(settings, ["ok"], raise_server_exceptions=False)
+    with client:
+        assert client.post("/chat", json={"message": "x", "stream": False}).status_code == 500
+        r = client.post("/chat", json={"message": "x", "stream": True})
+        assert r.status_code == 200
+        assert [e for e, _ in parse_sse(r.text)] == ["error"]
+        assert client.get("/sessions").json() == []
+        assert list(Path(settings.sessions_dir).glob("*.jsonl")) == []
+        assert not client.app.state.session_locks._busy
+
+
 def test_chat_auto_confirm_setting(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
     from dhaos.policy import auto_confirm
 
@@ -624,6 +926,6 @@ def test_default_kb_factory_used_when_none(settings: Settings) -> None:
     from dhaos.api.server import create_app
 
     app = create_app(settings, backend_factory=lambda s, n, m: FakeBackend(["ok"]))
-    with TestClient(app) as client:
+    with local_client(app) as client:
         assert isinstance(client.app.state.kb, KnowledgeManager)
         assert client.get("/kb").json() == []

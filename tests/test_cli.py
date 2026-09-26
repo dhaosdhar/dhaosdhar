@@ -212,6 +212,17 @@ def test_config_set_rejects_unknown_key_and_bad_value(invoke: Invoke, cfg: Path)
     assert cfg.read_text(encoding="utf-8") == before
 
 
+def test_config_set_rejects_max_iterations_below_one(invoke: Invoke, cfg: Path) -> None:
+    """Régression : ``agent.max_iterations`` ≤ 0 exécutait quand même un tour d'outils."""
+    before = cfg.read_text(encoding="utf-8")
+    previous = Settings.load(cfg, use_env=False).agent.max_iterations
+    result = invoke("config", "set", "agent.max_iterations", "0")
+    assert result.exit_code == 1
+    assert "valeur invalide pour agent.max_iterations" in result.output
+    assert cfg.read_text(encoding="utf-8") == before
+    assert Settings.load(cfg, use_env=False).agent.max_iterations == previous >= 1
+
+
 def test_config_set_masks_secret_in_output(invoke: Invoke, cfg: Path) -> None:
     result = invoke("config", "set", "api.token", "tres-secret")
     assert result.exit_code == 0, result.output
@@ -605,10 +616,10 @@ def test_train_dataset_and_corpus(invoke: Invoke, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(dataset_mod, "build_sft_dataset", build_sft_dataset, raising=False)
     monkeypatch.setattr(dataset_mod, "build_corpus", build_corpus, raising=False)
 
-    result = invoke("train", "dataset", "--base", "devx", "--base", "infra")
+    result = invoke("train", "dataset")
     assert result.exit_code == 0, result.output
     assert "3 exemples SFT" in result.output and "sft.jsonl" in result.output
-    assert seen["dataset"] == (None, ["devx", "infra"])
+    assert seen["dataset"] == (None, None)
 
     out = tmp_path / "c.txt"
     result = invoke("train", "corpus", "--out", str(out))
@@ -636,7 +647,9 @@ def test_train_nano_and_sample(invoke: Invoke, monkeypatch: pytest.MonkeyPatch, 
     corpus.write_text("def f():\n    return 1\n", encoding="utf-8")
     seen: dict[str, Any] = {}
 
-    def train_nano(settings: Settings, corpus_path: Path, *, name: str = "nano", overrides: dict, on_log=print) -> Any:
+    def train_nano(
+        settings: Settings, corpus_path: Path, *, name: str = "nano", overrides: dict, on_log=print, overwrite: bool = False
+    ) -> Any:
         seen["nano"] = (corpus_path, name, overrides)
         on_log("step 1 loss 2.0")
         return SimpleNamespace(out_dir=tmp_path / "models" / name, final_loss=1.2345, summary=lambda: "entraînement terminé")
@@ -709,3 +722,171 @@ def test_ask_confirm_handles_eof(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ui.ask_confirm("Supprimer ?") is False
     monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
     assert ui.ask_confirm("Supprimer ?") is True
+
+
+# ------------------------------------------------------------- régressions
+def test_config_set_ignores_env_and_cli_overrides(
+    invoke: Invoke, cfg: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Régression : ``config set`` figeait dans le fichier les surcharges
+    d'environnement (dont les secrets), ``--project`` et le ``data_dir``."""
+    monkeypatch.setenv("DHAOS__API__TOKEN", "SUPERSECRET")
+    monkeypatch.setenv("DHAOS__BACKENDS__DEFAULT", "claude")
+    project = tmp_path / "proj"
+    project.mkdir()
+    result = invoke("--project", str(project), "config", "set", "kb.top_k", "5")
+    assert result.exit_code == 0, result.output
+    assert "kb.top_k = 5" in result.output
+    saved = Settings.load(cfg, use_env=False)
+    assert saved.kb.top_k == 5
+    assert saved.backends.default == "ollama"
+    assert saved.api.token is None
+    assert saved.paths.project_root != project
+    assert "SUPERSECRET" not in cfg.read_text(encoding="utf-8")
+
+    # La clé modifiée reste surchargée par l'environnement : l'utilisateur est prévenu.
+    result = invoke("config", "set", "backends.default", "ollama")
+    assert result.exit_code == 0, result.output
+    assert "DHAOS__BACKENDS__DEFAULT" in result.output
+
+    # Sans fichier préexistant : seule la clé demandée est écrite (ni secret, ni data_dir absolu).
+    monkeypatch.setenv("DHAOS_DATA_DIR", str(tmp_path / "otherdata"))
+    fresh = tmp_path / "fresh" / "config.toml"
+    result = runner.invoke(app, ["--config", str(fresh), "config", "set", "kb.top_k", "7"])
+    assert result.exit_code == 0, result.output
+    text = fresh.read_text(encoding="utf-8")
+    assert "token =" not in text and "data_dir" not in text and "project_root" not in text
+    assert Settings.load(fresh, use_env=False).kb.top_k == 7
+
+    # ``null`` retire la clé du fichier au lieu d'y écrire une valeur vide.
+    result = runner.invoke(app, ["--config", str(fresh), "config", "set", "kb.top_k", "null"])
+    assert result.exit_code == 1  # top_k n'accepte pas null : validation pydantic
+    result = invoke("config", "set", "api.token", "abc")
+    assert result.exit_code == 0, result.output
+    assert Settings.load(cfg, use_env=False).api.token == "abc"
+    result = invoke("config", "set", "api.token", "null")
+    assert result.exit_code == 0, result.output
+    assert Settings.load(cfg, use_env=False).api.token is None
+    assert not any(line.startswith("token =") for line in cfg.read_text(encoding="utf-8").splitlines())
+
+
+def test_config_show_output_is_valid_toml_with_long_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Régression : la ligne ``# fichier : …`` était repliée par rich hors TTY
+    (80 colonnes), rendant la sortie redirigée non analysable."""
+    import tomllib
+
+    monkeypatch.setenv("COLUMNS", "80")
+    path = tmp_path / ("x" * 90) / "config.toml"
+    assert len(str(path)) > 80
+    result = runner.invoke(app, ["--config", str(path), "config", "init"])
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(app, ["--config", str(path), "config", "show"])
+    assert result.exit_code == 0, result.output
+    first = result.stdout.splitlines()[0]
+    assert first == f"# fichier : {path}"
+    data = tomllib.loads(result.stdout)
+    assert data["backends"]["default"] == "ollama"
+
+
+def test_kb_export_unwritable_parent(invoke: Invoke, kb_ready: None, tmp_path: Path) -> None:
+    """Régression : une ``OSError`` à l'export (parent non créable) sortait en trace."""
+    result = invoke("kb", "create", "t1")
+    assert result.exit_code == 0, result.output
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    result = invoke("kb", "export", "t1", str(blocker / "out.jsonl"))
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Erreur :" in result.output and "export impossible" in result.output
+    assert "Traceback" not in result.output
+
+
+def _assert_clean_failure(result: Any, *fragments: str) -> None:
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), repr(result.exception)
+    assert "Erreur :" in result.output and "Traceback" not in result.output
+    for fragment in fragments:
+        assert fragment in result.output
+
+
+def test_train_nano_and_sample_user_errors_are_clean(
+    invoke: Invoke, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Régression : ``FileNotFoundError`` / ``ValueError`` du module nano sortaient en trace."""
+    pytest.importorskip("torch")
+    empty_dir = tmp_path / "empty-model"
+    empty_dir.mkdir()
+    _assert_clean_failure(invoke("train", "sample", str(empty_dir), "salut"), "config.json manquant")
+
+    empty = tmp_path / "empty.txt"
+    empty.write_text("", encoding="utf-8")
+    _assert_clean_failure(invoke("train", "nano", str(empty), "--name", "t"), "corpus vide")
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("def f():\n    return 1\n" * 20, encoding="utf-8")
+    _assert_clean_failure(invoke("train", "nano", str(corpus), "--n-embd", "6", "--n-head", "4"), "divisible par n_head")
+    _assert_clean_failure(invoke("train", "nano", str(corpus), "--lr", "-1"), "learning_rate")
+    _assert_clean_failure(invoke("train", "nano", str(corpus), "--name", "../x"), "nom de modèle invalide")
+
+    monkeypatch.setenv("DHAOS__TRAIN__NANO__BPE_VOCAB_SIZE", "100")
+    _assert_clean_failure(invoke("train", "nano", str(corpus), "--steps", "1"), "vocab_size")
+
+
+def test_train_dataset_and_corpus_user_errors_are_clean(
+    invoke: Invoke, kb_ready: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from dhaos.train import dataset as dataset_mod
+
+    def broken(settings: Settings, out_path: Any = None) -> Any:
+        raise OSError("disque plein")
+
+    monkeypatch.setattr(dataset_mod, "build_sft_dataset", broken, raising=False)
+    _assert_clean_failure(invoke("train", "dataset"), "disque plein")
+    _assert_clean_failure(invoke("train", "corpus", "--base", "base_inconnue"), "base inconnue")
+
+
+def test_train_dataset_base_option_warns(invoke: Invoke, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Régression : ``--base`` était documenté mais ignoré en silence par ``train dataset``."""
+    from dhaos.train import dataset as dataset_mod
+
+    def build_sft_dataset(settings: Settings, out_path: Path | None = None, bases: list[str] | None = None) -> Any:
+        return SimpleNamespace(path=tmp_path / "sft.jsonl", n_examples=0, n_sessions_skipped=0, summary=lambda: "vide")
+
+    monkeypatch.setattr(dataset_mod, "build_sft_dataset", build_sft_dataset, raising=False)
+    result = invoke("train", "dataset", "--base", "devx")
+    assert result.exit_code == 0, result.output
+    assert "sans effet" in result.output
+    result = invoke("train", "dataset")
+    assert result.exit_code == 0, result.output
+    assert "sans effet" not in result.output
+    result = invoke("train", "dataset", "--help")
+    assert "--base" not in result.output
+
+
+def test_train_lora_user_errors_are_clean(invoke: Invoke, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Régression : ``ValueError`` / ``RuntimeError`` de ``run_finetune`` sortaient en
+    trace, et ``--epochs 0`` passait la validation Typer."""
+    from dhaos.train import finetune
+
+    monkeypatch.setattr(finetune, "finetune_available", lambda: (True, ""), raising=False)
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text('{"messages": []}\n', encoding="utf-8")
+    _assert_clean_failure(invoke("train", "lora", str(empty)), "aucun exemple avec une réponse assistant")
+
+    dataset = tmp_path / "ok.jsonl"
+    dataset.write_text(
+        json.dumps({"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "r"}]}) + "\n",
+        encoding="utf-8",
+    )
+    result = invoke("train", "lora", str(dataset), "--epochs", "0")
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValueError)
+    assert "--epochs doit être strictement positif" in result.output
+
+    def boom(settings: Settings, dataset_path: Path, *, out_dir: Path | None = None, overrides: dict, on_log=print) -> Path:
+        raise RuntimeError("fine-tuning indisponible : x")
+
+    monkeypatch.setattr(finetune, "run_finetune", boom, raising=False)
+    result = invoke("train", "lora", str(dataset))
+    _assert_clean_failure(result, "indisponible : x")
+    assert not isinstance(result.exception, RuntimeError)

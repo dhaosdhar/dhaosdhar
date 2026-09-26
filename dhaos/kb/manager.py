@@ -61,6 +61,18 @@ class Hit:
 
 
 @dataclass
+class NoteResult:
+    """Résultat de ``KnowledgeManager.add_note`` : ``replaced`` vaut ``True``
+    quand un document existant de même source a été remplacé (contenu
+    précédent perdu), ``False`` pour un ajout ou une note inchangée."""
+
+    doc_id: int
+    source: str
+    title: str
+    replaced: bool = False
+
+
+@dataclass
 class IngestReport:
     base: str
     added: int = 0
@@ -362,26 +374,46 @@ class KnowledgeManager:
         return report
 
     def add_text(self, base: str, text: str, *, source: str | None = None, title: str | None = None) -> int:
-        """Ajoute une note textuelle ; renvoie l'id du document."""
+        """Ajoute une note textuelle ; renvoie l'id du document (voir
+        ``add_note`` pour savoir si une note existante a été remplacée)."""
+        return self.add_note(base, text, source=source, title=title).doc_id
+
+    def add_note(self, base: str, text: str, *, source: str | None = None, title: str | None = None) -> NoteResult:
+        """Ajoute une note textuelle et renvoie un ``NoteResult``.
+
+        Source du document : ``source`` si fournie ; sinon ``note:<titre>``
+        quand un titre explicite est donné (même titre ⇒ remplacement,
+        signalé par ``replaced``) ; sinon ``note:<première ligne>#<hash>``,
+        de sorte que deux notes différentes commençant par la même ligne
+        coexistent au lieu de s'écraser (un texte strictement identique reste
+        dédupliqué).
+        """
         base_row = self._require_base(base)
         text = str(text or "")
         if not text.strip():
             raise KnowledgeError("note vide")
         self._ensure_embedder(base_row)
-        title = " ".join(str(title).split()) if title else ""
+        explicit_title = " ".join(str(title).split()) if title else ""
+        title = explicit_title
         if not title:
             first = next((line.strip() for line in text.splitlines() if line.strip()), "")
             title = first[:80]
         src = " ".join(str(source).split()) if source else ""
         if not src:
-            src = f"note:{title}" if title and title != text.strip()[:80] else f"note:{_text_hash(text)[:12]}"
+            digest = _text_hash(text)
+            if explicit_title:
+                src = f"note:{explicit_title}"
+            elif title and title != text.strip()[:80]:
+                src = f"note:{title}#{digest[:8]}"
+            else:
+                src = f"note:{digest[:12]}"
         report = IngestReport(base=str(base_row["name"]))
         doc_id = self._ingest_document(
             base_row, source=src, title=title, text=text, kind="text", report=report, on_progress=None
         )
         if doc_id is None:
             raise KnowledgeError("note vide")
-        return doc_id
+        return NoteResult(doc_id=doc_id, source=src, title=title, replaced=report.updated > 0)
 
     def list_documents(self, base: str) -> list[DocInfo]:
         row = self._require_base(base)
@@ -525,31 +557,40 @@ class KnowledgeManager:
         return out
 
     def reindex(self, base: str) -> int:
-        """Recalcule les embeddings avec l'embedder courant ; renvoie le nb de chunks."""
+        """Recalcule les embeddings avec l'embedder courant ; renvoie le nb de chunks.
+
+        Atomique : tous les embeddings sont calculés avant la moindre écriture,
+        puis les chunks et l'étiquette d'embedder de la base sont réécrits dans
+        une seule transaction. Un échec d'embedding (Ollama coupé, modèle absent)
+        laisse donc la base intacte au lieu de mélanger des dimensions."""
         row = self._require_base(base)
         base_id = int(row["id"])
         current = self._current_embedder_id()
-        total = 0
+        # (doc_id, chunks, embeddings, ids des chunks existants à mettre à jour ou None)
+        pending: list[tuple[int, list[str], np.ndarray, list[int] | None]] = []
         for doc in self.store.list_documents(base_id):
             doc_id = int(doc["id"])
             text = self.store.get_document_text(doc_id)
             kind = str(doc["kind"] or "text")
             chunks = self._chunks_for(text, kind) if text.strip() else []
-            if not chunks:
-                # Document sans texte conservé (ancien format) : on garde ses chunks.
-                existing = self.store.chunks_for_doc(doc_id)
-                chunks = [str(c["text"]) for c in existing]
-                if not chunks:
-                    continue
-                embeddings = self._embed(chunks)
-                self.store.update_embeddings([int(c["id"]) for c in existing], embeddings)
-                total += len(chunks)
+            if chunks:
+                pending.append((doc_id, chunks, self._embed(chunks), None))
                 continue
-            embeddings = self._embed(chunks)
-            with self.store.transaction():
+            # Document sans texte conservé (ancien format) : on garde ses chunks.
+            existing = self.store.chunks_for_doc(doc_id)
+            chunks = [str(c["text"]) for c in existing]
+            if not chunks:
+                continue
+            pending.append((doc_id, chunks, self._embed(chunks), [int(c["id"]) for c in existing]))
+        total = 0
+        with self.store.transaction():
+            for doc_id, chunks, embeddings, existing_ids in pending:
+                if existing_ids is not None:
+                    total += self.store.update_embeddings(existing_ids, embeddings)
+                    continue
                 self.store.delete_chunks(doc_id)
                 total += self.store.insert_chunks(doc_id, chunks, embeddings)
-        self.store.set_embedder(base_id, current)
+            self.store.set_embedder(base_id, current)
         return total
 
     def export(self, base: str, path: Path) -> int:
@@ -599,6 +640,7 @@ __all__ = [
     "IngestReport",
     "KnowledgeError",
     "KnowledgeManager",
+    "NoteResult",
     "ProgressCallback",
     "normalize_name",
 ]

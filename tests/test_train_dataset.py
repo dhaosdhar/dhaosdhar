@@ -273,3 +273,32 @@ def test_session_to_text_skips_empty_and_tool_turns() -> None:
     )
     assert session_to_text(parsed) == "### Assistant\nréponse"
     assert dataset.iter_session_files(Settings.model_validate({"paths": {"data_dir": "/nonexistent/dhaos-test"}})) == []
+
+
+# ------------------------------------------ régression : prompt système persisté
+def test_sft_example_carries_the_system_prompt_really_sent(settings: Settings, tmp_path: Path) -> None:
+    """Chemin réel agent → session → jeu SFT : le prompt système envoyé au
+    backend doit être persisté dans la meta de la session et ouvrir l'exemple."""
+    from dhaos.agent.session import SessionStore
+    from dhaos.runtime import build_runtime
+
+    from .fakes import FakeBackend, tool_call, tool_response
+
+    (settings.resolve_project_root() / "README.md").write_text("# Projet\nprint(1)\n", encoding="utf-8")
+    session = SessionStore(settings).create(backend="fake", model="fake-model")
+    assert "system_prompt" not in session.meta
+    backend = FakeBackend([tool_response(tool_call("read_file", path="README.md")), LONG_ANSWER])
+    runtime = build_runtime(settings, backend=backend, session=session, kb=False)
+    agent = runtime.agent
+    agent.run("Lis le README et résume-le.")
+    assert agent.system_prompt and backend.calls[0]["system"] == agent.system_prompt
+
+    meta = json.loads(session.path.read_text(encoding="utf-8").splitlines()[0])
+    assert meta["type"] == "meta" and meta["system_prompt"] == agent.system_prompt
+
+    report = build_sft_dataset(settings, out_path=tmp_path / "sft.jsonl", min_assistant_chars=1)
+    assert report.n_examples == 1
+    messages = _read_jsonl(report.path)[0]["messages"]
+    assert messages[0] == {"role": "system", "content": agent.system_prompt}
+    assert [m["role"] for m in messages[1:]] == ["user", "assistant", "tool", "assistant"]
+    assert "<tool_call>" in messages[2]["content"]

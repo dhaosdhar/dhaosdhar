@@ -1,6 +1,7 @@
 """Tests de l'outil run_command via ToolRegistry.execute."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -212,6 +213,106 @@ def test_shell_policy_ask_metacharacters_need_confirmation(settings: Settings, r
     assert not r.is_error and len(confirm.prompts) == 1
 
 
+# Régression : `find -delete` / `find -exec` en liste blanche supprimaient ou
+# lisaient des fichiers (même protégés par deny_patterns) sans confirmation.
+def test_find_delete_needs_confirmation(settings: Settings, registry: ToolRegistry, project_root: Path) -> None:
+    settings.tools.shell_policy = "ask"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    victim = project_root / "victim.txt"
+    victim.write_text("x", encoding="utf-8")
+    r = run(registry, ctx, command="find . -name victim.txt -delete")
+    assert r.is_error and "confirmation refusée" in r.content
+    assert len(confirm.prompts) == 1
+    assert victim.exists()
+
+
+def test_find_exec_on_protected_file_needs_confirmation(
+    settings: Settings, registry: ToolRegistry, tmp_path: Path
+) -> None:
+    settings.tools.shell_policy = "ask"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    home = tmp_path / "home"
+    conf_dir = home / ".config" / "dhaos"
+    conf_dir.mkdir(parents=True)
+    (conf_dir / "config.toml").write_text('brave_api_key = "SENTINEL-B2"\n', encoding="utf-8")
+    assert not ctx.policy.check_read(conf_dir / "config.toml").allowed
+    r = run(registry, ctx, command=f"find {conf_dir} -maxdepth 1 -name config.toml -exec cat {{}} +")
+    assert r.is_error and "confirmation refusée" in r.content
+    assert "SENTINEL-B2" not in r.content
+    assert len(confirm.prompts) == 1
+
+
+# Régression : les options d'écriture des commandes en liste blanche (sort -o,
+# git log --output, find -fprint) écrasaient des fichiers hors projet sans
+# confirmation, contournant write_policy = project.
+def test_sort_output_outside_project_needs_confirmation(
+    settings: Settings, registry: ToolRegistry, project_root: Path, tmp_path: Path
+) -> None:
+    settings.tools.shell_policy = "ask"
+    settings.tools.write_policy = "project"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    target = tmp_path / "home" / "notes.txt"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    src = project_root / "in.txt"
+    src.write_text("b\na\n", encoding="utf-8")
+    assert ctx.policy.check_write(target).needs_confirmation
+    r = run(registry, ctx, command=f"sort -o {target} {src}")
+    assert r.is_error and "confirmation refusée" in r.content
+    assert len(confirm.prompts) == 1
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"
+    # Sans option d'écriture, sort reste auto-autorisé.
+    r = run(registry, ctx, command=f"sort {src}")
+    assert not r.is_error and "a\nb\n" in r.content
+    assert len(confirm.prompts) == 1
+
+
+def test_git_log_output_outside_project_needs_confirmation(
+    settings: Settings, registry: ToolRegistry, project_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git absent")
+    for key in list(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key, raising=False)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(tmp_path / "home")}
+    subprocess.run(["git", "init", "-q"], cwd=project_root, env=env, check=True)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "SUBJECT-SENTINEL"], cwd=project_root, env=env, check=True)
+    settings.tools.shell_policy = "ask"
+    settings.tools.write_policy = "project"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    target = tmp_path / "home" / "notes.txt"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    r = run(registry, ctx, command=f"git log --output={target} --format=%s")
+    assert r.is_error and "confirmation refusée" in r.content
+    assert len(confirm.prompts) == 1
+    assert target.read_text(encoding="utf-8") == "ORIGINAL"
+    r = run(registry, ctx, command="git log --oneline")
+    assert not r.is_error and "SUBJECT-SENTINEL" in r.content
+    assert len(confirm.prompts) == 1
+
+
+def test_find_fprint_outside_project_needs_confirmation(
+    settings: Settings, registry: ToolRegistry, project_root: Path, tmp_path: Path
+) -> None:
+    settings.tools.shell_policy = "ask"
+    settings.tools.write_policy = "project"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    target = tmp_path / "home" / "created_by_find.txt"
+    r = run(registry, ctx, command=f"find {project_root} -maxdepth 0 -fprint {target}")
+    assert r.is_error and "confirmation refusée" in r.content
+    assert len(confirm.prompts) == 1
+    assert not target.exists()
+
+
 def test_confirm_exception_is_refusal(settings: Settings, registry: ToolRegistry) -> None:
     settings.tools.shell_policy = "ask"
 
@@ -226,3 +327,104 @@ def test_confirm_exception_is_refusal(settings: Settings, registry: ToolRegistry
 def test_invalid_utf8_output_replaced(registry: ToolRegistry, ctx: ToolContext) -> None:
     r = run(registry, ctx, command="printf 'ok\\xff\\n'")
     assert not r.is_error and "ok�" in r.content
+
+
+# Régression : les commandes en liste blanche (cat, head, tail, grep) lisaient
+# les fichiers protégés (deny_patterns) que read_file / grep refusent, sans
+# confirmation — y compris via l'API (never_confirm).
+@pytest.fixture
+def secrets(tmp_path: Path, project_root: Path) -> dict[str, Path]:
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_rsa").write_text("PRIVATE-KEY-SENTINEL-A1\n", encoding="utf-8")
+    (home / ".config" / "dhaos").mkdir(parents=True)
+    (home / ".config" / "dhaos" / "config.toml").write_text('brave_api_key = "SENTINEL-B2"\n', encoding="utf-8")
+    (project_root / ".env").write_text("SECRET=SENTINEL-D4\n", encoding="utf-8")
+    return {"home": home, "project": project_root}
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["cat ~/.ssh/id_rsa", "head -c 40 ~/.ssh/id_rsa", "grep -r SENTINEL {home}/.config/dhaos",
+     "cat /proc/self/status", "tail {project}/.env", "tail .env"],
+)
+def test_whitelisted_commands_cannot_read_protected_paths(
+    settings: Settings, registry: ToolRegistry, secrets: dict[str, Path], template: str
+) -> None:
+    settings.tools.shell_policy = "ask"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    command = template.format(**secrets)
+    r = run(registry, ctx, command=command)
+    assert r.is_error and r.content.startswith("commande refusée") and "protégé" in r.content
+    assert confirm.prompts == [f"Exécuter : {command} ? "]
+    for sentinel in ("SENTINEL-A1", "SENTINEL-B2", "SENTINEL-D4"):
+        assert sentinel not in r.content
+    assert ctx.journal.tail() == []
+
+
+def test_whitelisted_read_via_api_never_confirm_is_refused(
+    settings: Settings, registry: ToolRegistry, secrets: dict[str, Path]
+) -> None:
+    from dhaos.policy import never_confirm
+
+    settings.tools.shell_policy = "ask"
+    ctx = make_ctx(settings, never_confirm)
+    r = run(registry, ctx, command="cat ~/.ssh/id_rsa")
+    assert r.is_error and "SENTINEL-A1" not in r.content
+    r = run(registry, ctx, command="cat README.md")
+    assert not r.is_error  # lecture ordinaire du projet toujours auto-autorisée
+
+
+def test_relative_protected_path_resolved_from_cwd(
+    settings: Settings, registry: ToolRegistry, secrets: dict[str, Path]
+) -> None:
+    settings.tools.shell_policy = "ask"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    r = run(registry, ctx, command="cat id_rsa", cwd=str(secrets["home"] / ".ssh"))
+    assert r.is_error and "protégé" in r.content and "SENTINEL-A1" not in r.content
+    assert len(confirm.prompts) == 1
+
+
+# Régression : scrub_env ne filtrait que par fragment de nom ; DATABASE_URL
+# (user:mdp@hôte), SSH_AUTH_SOCK, GPG_AGENT_INFO passaient et `printenv`
+# (liste blanche) les livrait au modèle sans confirmation.
+def test_scrub_env_hides_urls_with_credentials_and_agent_sockets() -> None:
+    env = shell.scrub_env({
+        "DATABASE_URL": "postgres://u:p@h/db", "REDIS_URL": "redis://:p@h", "PG_DSN": "postgresql://user:pw@db:5432/x",
+        "SSH_AUTH_SOCK": "/s", "SSH_AGENT_PID": "12", "GPG_AGENT_INFO": "/g", "ssh_auth_sock": "/s2",
+        "PATH": "/bin", "HOME": "/h", "API_URL": "https://example.org/api", "PUBLIC_URL": "https://u@h/",
+    })
+    assert env == {"PATH": "/bin", "HOME": "/h", "API_URL": "https://example.org/api", "PUBLIC_URL": "https://u@h/"}
+    assert shell.is_sensitive_env("DATABASE_URL", "mysql://root:root@localhost/app")
+    assert not shell.is_sensitive_env("DATABASE_URL", "sqlite:///tmp/app.db")
+
+
+def test_printenv_needs_confirmation_and_env_secrets_hidden(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, registry: ToolRegistry
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:s3cr3t@h/db")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/user/1000/agent.sock")
+    monkeypatch.setenv("DHAOS_PLAIN_VAR", "visible")
+    settings.tools.shell_policy = "ask"
+    confirm = Confirm(False)
+    ctx = make_ctx(settings, confirm)
+    for command in ("printenv", "printenv DATABASE_URL", "env"):
+        r = run(registry, ctx, command=command)
+        assert r.is_error and r.content.startswith("commande refusée")
+        assert "s3cr3t" not in r.content and "agent.sock" not in r.content
+    assert len(confirm.prompts) == 3
+    # Même confirmée (ou en shell_policy = auto), l'environnement reste expurgé.
+    settings.tools.shell_policy = "auto"
+    r = run(registry, make_ctx(settings), command="printenv")
+    assert not r.is_error and "DHAOS_PLAIN_VAR=visible" in r.content
+    assert "s3cr3t" not in r.content and "DATABASE_URL" not in r.content and "SSH_AUTH_SOCK" not in r.content
+
+
+# Régression : le schéma de run_command acceptait des propriétés inconnues.
+def test_run_command_rejects_extra_args(registry: ToolRegistry, ctx: ToolContext) -> None:
+    r = registry.execute(tool_call("run_command", command="echo ok", cmd="rm -rf /"), ctx)
+    assert r.is_error and "INVALID_JSON" in r.content and "Additional properties" in r.content
+    assert ctx.journal.tail() == []
+    assert shell.tools(ctx.settings)[0].parameters["additionalProperties"] is False

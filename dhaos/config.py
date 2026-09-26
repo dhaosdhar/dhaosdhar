@@ -89,7 +89,13 @@ DEFAULT_DENY_PATTERNS: list[str] = [
 ]
 
 # Commandes exécutées sans confirmation quand shell_policy = "ask"
-# (comparaison sur les premiers mots ; aucun métacaractère shell accepté).
+# (comparaison sur les premiers mots ; aucun métacaractère shell accepté ;
+# les options listées dans DEFAULT_SHELL_UNSAFE_OPTIONS retirent la commande
+# de la liste blanche, ainsi qu'un argument-chemin refusé par check_read).
+# La liste blanche ne remplace ni check_read ni check_write : une commande qui
+# lit un chemin protégé, écrit ou exécute via un argument reste soumise à
+# confirmation. `env` / `printenv` n'y figurent pas : l'environnement, même
+# expurgé, ne doit pas être livré au modèle sans confirmation.
 DEFAULT_SHELL_AUTO_ALLOW: list[str] = [
     "ls", "cat", "head", "tail", "wc", "stat", "file", "which", "pwd", "echo",
     "tree", "du", "df", "find", "grep", "rg", "diff", "sort", "uniq",
@@ -98,8 +104,27 @@ DEFAULT_SHELL_AUTO_ALLOW: list[str] = [
     "python --version", "python3 --version", "pip list", "pip show",
     "pytest", "python -m pytest", "python3 -m pytest",
     "node --version", "npm ls", "cargo --version", "go version", "make -n",
-    "uname", "id", "date", "env | grep", "printenv",
+    "uname", "id", "date",
 ]
+
+# Options qui font écrire, supprimer ou exécuter un programme à une commande
+# de la liste blanche : leur présence impose la confirmation (shell_policy =
+# "ask"). Clé : nom du programme (premier mot ; ``python -m X`` compte comme
+# ``X``). Une option longue ``--xxx`` est aussi reconnue abrégée (``--out=``,
+# GNU/argparse) ; une option courte ``-o`` aussi collée ou groupée (``-ofichier``,
+# ``-ro``) ; un mot ``-exec`` (style find) seulement à l'identique.
+DEFAULT_SHELL_UNSAFE_OPTIONS: dict[str, tuple[str, ...]] = {
+    "find": ("-exec", "-execdir", "-ok", "-okdir", "-delete",
+             "-fprint", "-fprint0", "-fprintf", "-fls"),
+    "sort": ("-o", "--output", "-T", "--temporary-directory"),
+    "tree": ("-o",),
+    "git": ("--output",),
+    "pytest": ("--basetemp", "--junitxml", "--junit-xml", "--log-file", "-o", "--override-ini"),
+}
+
+# Nombre maximal d'arguments positionnels (hors options) toléré sans
+# confirmation : ``uniq ENTRÉE SORTIE`` écrit dans son second argument.
+DEFAULT_SHELL_MAX_POSITIONALS: dict[str, int] = {"uniq": 1}
 
 
 class PathsConfig(BaseModel):
@@ -176,7 +201,7 @@ class KBConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_iterations: int = 40  # nombre max de tours outil par requête
+    max_iterations: int = Field(default=40, ge=1)  # nombre max de tours outil par requête (≥ 1)
     collect_traces: bool = True  # sessions conservées pour l'entraînement
     auto_kb_search: bool = True  # inciter le modèle à consulter les bases de savoir
     extra_system_prompt: str = ""
@@ -186,7 +211,17 @@ class AgentConfig(BaseModel):
 class APIConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8642
-    token: str | None = None  # Bearer requis si défini
+    # Jeton Bearer exigé sur toutes les routes (sauf l'état minimal de /health).
+    # Absent => un jeton aléatoire est généré au démarrage et affiché par
+    # `dhaos serve` : l'API n'est jamais accessible sans jeton.
+    token: str | None = None
+    # En-têtes Host acceptés (sans port) ; vide => localhost, 127.0.0.1, ::1 et
+    # api.host. "*" désactive le contrôle (derrière un reverse proxy de confiance).
+    allowed_hosts: list[str] = Field(default_factory=list)
+    # Origines navigateur autorisées (schéma://hôte[:port]) ; vide => toute
+    # requête portant un en-tête Origin est refusée (aucun client navigateur
+    # attendu, protection contre le DNS rebinding).
+    allowed_origins: list[str] = Field(default_factory=list)
     # L'API n'a personne à qui demander : False => les actions qui exigent une
     # confirmation sont refusées ; True => confirmées automatiquement (dangereux).
     auto_confirm: bool = False

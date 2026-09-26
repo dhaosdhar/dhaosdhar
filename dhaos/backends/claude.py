@@ -26,6 +26,10 @@ MAX_JSON_RETRIES = 2  # réémissions d'un tour dont le JSON d'outil est imparsa
 
 _MAX_TOKENS_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
 _EMPTY_RESULT = "(aucune sortie)"
+_TOOL_BLOCK_TYPES = frozenset({"tool_use", "tool_result"})
+_SERVER_ERROR_TYPES = frozenset({"overloaded_error", "api_error"})
+_REPLAY_MARKER = "\n[réémission]\n"
+_AUTH_TYPE_ERROR_HINT = "authentication method"
 
 
 def _jsonable(value: Any) -> Any:
@@ -54,6 +58,66 @@ def _looks_like_key_material(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _history_tool_names(claude_messages: list[dict[str, Any]]) -> list[str]:
+    """Noms des outils référencés par des blocs ``tool_use`` de l'historique
+    (liste vide si l'historique ne contient aucun bloc ``tool_use``/``tool_result``)."""
+    names: list[str] = []
+    has_tool_blocks = False
+    for msg in claude_messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict) or blk.get("type") not in _TOOL_BLOCK_TYPES:
+                continue
+            has_tool_blocks = True
+            name = blk.get("name")
+            if blk.get("type") == "tool_use" and isinstance(name, str) and name and name not in names:
+                names.append(name)
+    return names if has_tool_blocks else []
+
+
+class _ReplaySafeCallback:
+    """Enveloppe un ``on_text``/``on_thinking`` pour qu'une réémission du tour
+    (JSON d'outil illisible) ne rediffuse pas ce que l'utilisateur a déjà vu.
+
+    Le texte déjà diffusé est mémorisé ; à la tentative suivante, seul le
+    prolongement inédit est émis. Si la nouvelle réponse diverge du préfixe
+    déjà affiché, un marqueur de réémission est émis une fois avant le texte.
+    """
+
+    def __init__(self, callback: TextCallback | None):
+        self._callback = callback
+        self._shown = ""
+        self._current = ""
+        self._diverged = False
+
+    def restart(self) -> None:
+        """À appeler avant chaque nouvelle tentative : fige ce qui est affiché."""
+        if self._diverged or len(self._current) > len(self._shown):
+            self._shown = self._current
+        self._current = ""
+        self._diverged = False
+
+    def __call__(self, chunk: str) -> None:
+        if not chunk or self._callback is None:
+            return
+        previous = self._current
+        self._current += chunk
+        if self._diverged:
+            self._callback(chunk)
+            return
+        if self._shown.startswith(self._current):
+            return  # préfixe déjà affiché lors d'une tentative précédente
+        if self._current.startswith(self._shown):
+            # Prolongement : n'émettre que la partie inédite.
+            start = max(len(self._shown), len(previous))
+            self._callback(self._current[start:])
+            return
+        self._diverged = True
+        self._callback(_REPLAY_MARKER + chunk if self._shown else chunk)
+
+
 class ClaudeBackend(Backend):
     name = "claude"
 
@@ -62,6 +126,9 @@ class ClaudeBackend(Backend):
         self.cfg = settings.backends.claude
         self.model = model or self.cfg.model
         self._client = client
+        # Dernières définitions d'outils transmises : l'API exige un paramètre
+        # ``tools`` dès que l'historique contient des blocs tool_use/tool_result.
+        self._last_tools: list[ToolSpec] = []
 
     # ------------------------------------------------------------ client
     @property
@@ -133,11 +200,20 @@ class ClaudeBackend(Backend):
     def build_params(
         self, messages: list[Message], *, system: str = "", tools: list[ToolSpec] | None = None
     ) -> dict[str, Any]:
-        """Paramètres de ``client.beta.messages.stream`` pour un tour."""
+        """Paramètres de ``client.beta.messages.stream`` pour un tour.
+
+        Sans ``tools`` (tour de clôture après ``max_iterations``) alors que
+        l'historique contient des blocs ``tool_use``/``tool_result``, l'API
+        refuse la requête (« must define tools ») : on rejoue alors les
+        dernières définitions connues (ou des définitions minimales déduites
+        de l'historique) avec ``tool_choice = none`` pour interdire tout
+        nouvel appel.
+        """
+        claude_messages = self.to_claude_messages(messages)
         params: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.cfg.max_tokens,
-            "messages": self.to_claude_messages(messages),
+            "messages": claude_messages,
             "thinking": {"type": "adaptive", "display": self.cfg.thinking_display},
             "output_config": {"effort": self.cfg.effort},
             "cache_control": {"type": "ephemeral"},
@@ -145,7 +221,17 @@ class ClaudeBackend(Backend):
         if system:
             params["system"] = [{"type": "text", "text": system}]
         if tools:
+            self._last_tools = list(tools)
             params["tools"] = [self._tool_to_claude(t) for t in tools]
+        else:
+            history_names = _history_tool_names(claude_messages)
+            if history_names:
+                replayed = self._last_tools or [
+                    ToolSpec(name=n, description="(outil indisponible pour ce tour)", parameters={"type": "object"})
+                    for n in history_names
+                ]
+                params["tools"] = [self._tool_to_claude(t) for t in replayed]
+                params["tool_choice"] = {"type": "none"}
         if self.cfg.fallbacks:
             params["betas"] = [FALLBACK_BETA]
             params["fallbacks"] = "default"
@@ -166,20 +252,29 @@ class ClaudeBackend(Backend):
         params = self.build_params(messages, system=system, tools=tools)
         final: Any = None
         attempts = 0
+        # En cas de réémission (ValueError), ne pas rediffuser le texte déjà vu.
+        emit_text = _ReplaySafeCallback(on_text)
+        emit_thinking = _ReplaySafeCallback(on_thinking)
         while final is None:
+            emit_text.restart()
+            emit_thinking.restart()
             try:
                 with self.client.beta.messages.stream(**params) as stream:
                     for event in stream:
                         etype = getattr(event, "type", None)
                         if etype == "text":
-                            chunk = getattr(event, "text", "")
-                            if on_text and chunk:
-                                on_text(chunk)
+                            emit_text(getattr(event, "text", "") or "")
                         elif etype == "thinking":
-                            chunk = getattr(event, "thinking", "")
-                            if on_thinking and chunk:
-                                on_thinking(chunk)
+                            emit_thinking(getattr(event, "thinking", "") or "")
                     final = stream.get_final_message()
+            except TypeError as exc:
+                # Le SDK lève TypeError quand aucune méthode d'authentification
+                # n'est résolue (ni clé, ni jeton, ni profil).
+                if _AUTH_TYPE_ERROR_HINT not in str(exc):
+                    raise
+                raise BackendError(
+                    "clé API absente ou invalide : définissez ANTHROPIC_API_KEY (ou `ant auth login`)"
+                ) from exc
             except ValueError as exc:
                 # JSON d'appel d'outil que le SDK n'a pas pu parser : le bloc
                 # n'a pas d'identifiant à répondre, on réémet le tour (borné).
@@ -206,17 +301,37 @@ class ClaudeBackend(Backend):
                         retry_after = f" (réessayez dans {value} s)"
                 raise BackendError(f"limite de débit Anthropic atteinte{retry_after} : {exc.message}") from exc
             except anthropic.APIStatusError as exc:
-                if exc.status_code >= 500:
-                    raise BackendError(
-                        f"erreur côté serveur Anthropic (HTTP {exc.status_code}) : réessayez plus tard — {exc.message}"
-                    ) from exc
-                raise BackendError(f"requête refusée par l'API Anthropic (HTTP {exc.status_code}) : {exc.message}") from exc
+                raise self._status_error(exc) from exc
             except anthropic.APIConnectionError as exc:
                 raise BackendError(
                     "impossible de joindre l'API Anthropic : vérifiez la connexion réseau, le proxy "
                     f"ou backends.claude.base_url ({exc})"
                 ) from exc
         return self._to_response(final)
+
+    @staticmethod
+    def _status_error(exc: Any) -> BackendError:
+        """``APIStatusError`` → ``BackendError`` actionnable.
+
+        Un événement SSE ``error`` reçu en cours de flux (``overloaded_error``,
+        ``api_error``) arrive avec le statut de la réponse HTTP déjà acceptée
+        (200) : on le traite comme une erreur serveur réessayable, jamais comme
+        une requête refusée.
+        """
+        status = int(getattr(exc, "status_code", 0) or 0)
+        err_type = getattr(exc, "type", None)
+        detail = ""
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            detail = str(body["error"].get("message") or "")
+        message = detail or str(getattr(exc, "message", "") or exc)
+        mid_stream = status == 200
+        if err_type == "rate_limit_error":
+            return BackendError(f"limite de débit Anthropic atteinte : {message}")
+        if err_type in _SERVER_ERROR_TYPES or status >= 500 or mid_stream:
+            origin = str(err_type) if err_type else f"HTTP {status}"
+            return BackendError(f"erreur côté serveur Anthropic ({origin}) : réessayez plus tard — {message}")
+        return BackendError(f"requête refusée par l'API Anthropic (HTTP {status}) : {message}")
 
     # ------------------------------------------------------------ mapping
     def _to_response(self, final: Any) -> ChatResponse:
@@ -236,17 +351,19 @@ class ClaudeBackend(Backend):
                 )
             elif btype == "thinking":
                 thinking_parts.append(str(getattr(block, "thinking", "") or ""))
-        raw = [_block_to_dict(b) for b in content]
 
         text = "".join(text_parts)
         api_stop = getattr(final, "stop_reason", None)
         stop_reason: StopReason
+        dropped_calls = False
         if api_stop in _MAX_TOKENS_REASONS:
             stop_reason = "max_tokens"
             tool_calls = []  # entrée d'outil potentiellement tronquée : on n'exécute rien
+            dropped_calls = True
         elif api_stop == "refusal":
             stop_reason = "refusal"
             tool_calls = []
+            dropped_calls = True
             details = getattr(final, "stop_details", None)
             if details is not None:
                 category = getattr(details, "category", None)
@@ -261,9 +378,24 @@ class ClaudeBackend(Backend):
             # end_turn, stop_sequence, pause_turn ou valeur inconnue.
             stop_reason = "end_turn"
 
+        # Charge brute à rejouer. Les appels abandonnés (tronqués/refusés) ne
+        # recevront jamais de tool_result : les rejouer bloquerait la session
+        # (l'API exige un tool_result après chaque tool_use).
+        raw_blocks = [
+            _block_to_dict(b) for b in content if not (dropped_calls and getattr(b, "type", None) == "tool_use")
+        ]
+        raw: Any = raw_blocks if any(b.get("type") in ("text", "tool_use") for b in raw_blocks) else None
+
         usage_obj = getattr(final, "usage", None)
+        # Avec la mise en cache, l'API ventile l'entrée entre input_tokens,
+        # cache_read_input_tokens et cache_creation_input_tokens : on totalise
+        # pour rester cohérent avec Ollama (prompt_eval_count = prompt complet).
+        input_total = sum(
+            int(getattr(usage_obj, field, 0) or 0)
+            for field in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        )
         usage = Usage(
-            input_tokens=int(getattr(usage_obj, "input_tokens", 0) or 0),
+            input_tokens=input_total,
             output_tokens=int(getattr(usage_obj, "output_tokens", 0) or 0),
         )
         return ChatResponse(
@@ -288,16 +420,49 @@ class ClaudeBackend(Backend):
             result["ok"] = True
             result["detail"] = f"jeton détecté via ANTHROPIC_AUTH_TOKEN ; modèle {self.model}"
             return result
-        profile_dir = Path(os.path.expanduser("~/.config/anthropic"))
-        if profile_dir.is_dir():
+        profile_ok, profile_detail = self._probe_profile()
+        if profile_ok:
             result["ok"] = True
-            result["detail"] = f"profil `ant auth login` détecté ({profile_dir}) ; modèle {self.model}"
+            result["detail"] = f"{profile_detail} ; modèle {self.model}"
             return result
         result["detail"] = (
             "aucune clé API détectée : définissez ANTHROPIC_API_KEY (ou ANTHROPIC_AUTH_TOKEN) "
             "ou lancez `ant auth login`"
         )
+        if profile_detail:
+            result["detail"] += f" — {profile_detail}"
         return result
+
+    @staticmethod
+    def _probe_profile() -> tuple[bool, str]:
+        """Résout un profil ``ant auth login`` comme le ferait le SDK (sans réseau).
+
+        Respecte ``ANTHROPIC_CONFIG_DIR`` / ``ANTHROPIC_PROFILE`` et le fichier
+        ``active_config`` ; un dossier de configuration vide n'est pas un
+        profil. Renvoie ``(ok, détail)``.
+        """
+        import anthropic
+
+        try:
+            from anthropic.lib.credentials import default_credentials
+            from anthropic.lib.credentials._constants import _active_profile, _config_dir
+        except ImportError:  # pragma: no cover — SDK sans module credentials
+            profile_dir = Path(os.path.expanduser("~/.config/anthropic"))
+            if (profile_dir / "configs").is_dir() and (profile_dir / "credentials").is_dir():
+                return True, f"profil `ant auth login` détecté ({profile_dir})"
+            return False, ""
+        try:
+            config_dir = _config_dir()
+            profile = _active_profile()
+        except (OSError, anthropic.AnthropicError) as exc:
+            return False, f"profil `ant auth login` illisible : {exc}"
+        try:
+            found = default_credentials() is not None
+        except (OSError, anthropic.AnthropicError) as exc:
+            return False, f"profil `ant auth login` `{profile}` invalide ({config_dir}) : {exc}"
+        if found:
+            return True, f"profil `ant auth login` `{profile}` détecté ({config_dir})"
+        return False, ""
 
 
 __all__ = ["ClaudeBackend", "FALLBACK_BETA", "MAX_JSON_RETRIES"]

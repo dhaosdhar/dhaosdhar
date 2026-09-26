@@ -9,8 +9,19 @@ l'application :
   ``dhaos.runtime.build_runtime`` (backend, outils, session persistée) ;
 - la confirmation des actions sensibles suit ``api.auto_confirm`` (sinon
   elles sont refusées : l'API n'a personne à qui demander) ;
-- si ``api.token`` est défini, toutes les routes sauf ``/health`` exigent
-  ``Authorization: Bearer <token>``.
+- toutes les routes exigent ``Authorization: Bearer <token>`` : ``api.token``
+  ou, à défaut, un jeton aléatoire généré à la construction et exposé dans
+  ``app.state.token`` (affiché par ``dhaos serve``). L'API donne le même accès
+  disque que la CLI ; elle n'est donc jamais servie sans jeton. ``/health``
+  reste joignable sans jeton mais ne renvoie alors qu'un état minimal
+  (ni détail du backend, ni appel sortant) ;
+- un garde Host/Origin (``HostOriginGuard``) refuse les requêtes dont
+  l'en-tête ``Host`` n'est pas attendu (400 ; ``api.allowed_hosts``, défaut :
+  localhost, 127.0.0.1, ::1 et ``api.host``) et celles portant un ``Origin``
+  non listé dans ``api.allowed_origins`` (403 ; vide par défaut), ce qui
+  neutralise le DNS rebinding depuis un navigateur ;
+- l'ingestion (``POST /kb/{name}/documents``) soumet chaque fichier, y
+  compris ceux d'un dossier parcouru, à ``AccessPolicy.check_read``.
 
 Le serveur n'est pas lancé ici : la CLI (``dhaos serve``) s'en charge ;
 ``main()`` est un point d'entrée autonome facultatif.
@@ -22,12 +33,17 @@ import hmac
 import json
 import logging
 import queue
+import secrets
+import sys
 import threading
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Callable, Iterator
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Iterable, Iterator
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__
 from ..agent.loop import Agent, AgentResult
@@ -35,6 +51,7 @@ from ..agent.session import Session, SessionStore
 from ..backends import get_backend
 from ..backends.base import Backend, BackendError
 from ..config import Settings
+from ..kb.ingest import iter_files
 from ..kb.manager import KnowledgeError, normalize_name
 from ..policy import AccessPolicy, Journal, auto_confirm, never_confirm
 from ..runtime import build_runtime
@@ -51,6 +68,7 @@ SECRET_KEYS: tuple[str, ...] = ("web.brave_api_key", "api.token")
 MASK = "***"
 KEEPALIVE_SECONDS = 15.0
 MAX_JOURNAL_ENTRIES = 1000
+LOCAL_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 
 _END = object()  # sentinelle de fin de flux
 
@@ -120,6 +138,66 @@ def _done_payload(result: AgentResult, session_id: str) -> dict[str, Any]:
     }
 
 
+def host_name(header: str) -> str:
+    """Nom d'hôte d'un en-tête ``Host`` (port et crochets IPv6 retirés, minuscules)."""
+    value = str(header or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else value
+    if value.count(":") == 1:
+        value = value.rsplit(":", 1)[0]
+    return value
+
+
+def allowed_hosts_for(settings: Settings) -> set[str]:
+    """Hôtes acceptés : ``api.allowed_hosts`` ou, à défaut, les adresses locales
+    et ``api.host`` (``*`` désactive le contrôle)."""
+    configured = [host_name(h) for h in settings.api.allowed_hosts if str(h).strip()]
+    if configured:
+        return set(configured)
+    return {*LOCAL_HOSTS, host_name(settings.api.host)} - {""}
+
+
+def normalize_origin(origin: str) -> str:
+    """Origine navigateur comparable : minuscules, sans barre oblique finale."""
+    return str(origin or "").strip().rstrip("/").lower()
+
+
+class HostOriginGuard:
+    """Middleware ASGI : 400 si l'en-tête ``Host`` n'est pas attendu (DNS
+    rebinding, hôte de proxy non prévu), 403 si un en-tête ``Origin`` est
+    présent sans figurer dans les origines autorisées (requête navigateur
+    inter-sites ou après rebinding). Les autres requêtes passent telles quelles."""
+
+    def __init__(self, app: ASGIApp, *, allowed_hosts: Iterable[str], allowed_origins: Iterable[str]) -> None:
+        self.app = app
+        self.hosts = {host_name(h) for h in allowed_hosts} - {""}
+        self.origins = {normalize_origin(o) for o in allowed_origins} - {""}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        host = host_name(headers.get("host", ""))
+        if "*" not in self.hosts and host not in self.hosts:
+            response = JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": f"en-tête Host non autorisé : {host or '(absent)'} (voir api.allowed_hosts)"},
+            )
+            await response(scope, receive, send)
+            return
+        origin = headers.get("origin")
+        if origin is not None and "*" not in self.origins and normalize_origin(origin) not in self.origins:
+            response = JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "origine navigateur non autorisée (voir api.allowed_origins)"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 class SessionLocks:
     """Une session ne sert qu'un tour à la fois (le fichier JSONL est réécrit
     intégralement par l'agent) ; un second appel concurrent reçoit 409."""
@@ -145,9 +223,10 @@ class SessionLocks:
 
 
 # ============================================================ flux de chat
-def run_agent_to_queue(agent: Agent, session_id: str, message: str, events: "queue.Queue[Any]") -> None:
+def run_agent_to_queue(agent: Agent, session_id: str, message: str, events: "queue.Queue[Any]") -> bool:
     """Exécute ``Agent.run`` (synchrone) en poussant les événements SSE dans
-    ``events`` ; termine toujours par la sentinelle de fin."""
+    ``events`` ; termine toujours par la sentinelle de fin. Renvoie ``False``
+    si l'agent a levé une exception (événement ``error`` émis)."""
 
     def put(event: str, data: dict[str, Any]) -> None:
         events.put((event, data))
@@ -174,9 +253,11 @@ def run_agent_to_queue(agent: Agent, session_id: str, message: str, events: "que
             on_tool_result=on_tool_result,
         )
         put("done", _done_payload(result, session_id))
+        return True
     except Exception as e:  # noqa: BLE001 — le flux doit toujours se terminer proprement
         log.exception("échec de l'agent (session %s)", session_id)
         put("error", {"detail": f"{type(e).__name__}: {e}"})
+        return False
     finally:
         events.put(_END)
 
@@ -207,7 +288,9 @@ def create_app(
     make_backend: BackendFactory = backend_factory or default_backend_factory
     make_kb: KBFactory = kb_factory or default_kb_factory
     confirm = auto_confirm if settings.api.auto_confirm else never_confirm
-    token = settings.api.token or None
+    token_generated = not settings.api.token
+    token = settings.api.token or secrets.token_urlsafe(32)
+    token_bytes = token.encode("utf-8")
 
     settings.ensure_dirs()
     kb = make_kb(settings)
@@ -239,10 +322,17 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.token = token
+    app.state.token_generated = token_generated
     app.state.kb = kb
     app.state.kb_lock = kb_lock
     app.state.session_locks = session_locks
     app.state.close_kb = close_kb
+    app.add_middleware(
+        HostOriginGuard,
+        allowed_hosts=allowed_hosts_for(settings),
+        allowed_origins=list(settings.api.allowed_origins),
+    )
 
     # ----------------------------------------------------------- erreurs
     @app.exception_handler(Exception)
@@ -254,12 +344,17 @@ def create_app(
         )
 
     # ------------------------------------------------------ authentification
-    async def require_token(request: Request) -> None:
-        if token is None:
-            return
+    def authenticated(request: Request) -> bool:
+        """``True`` si la requête porte le jeton (``Authorization: Bearer``).
+        Comparaison en octets : ``compare_digest`` refuse les ``str`` non ASCII
+        (un en-tête latin-1 ne doit pas provoquer de 500)."""
         header = request.headers.get("authorization", "")
         scheme, _, value = header.partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(value.strip(), token):
+        presented = value.strip().encode("utf-8", "surrogateescape")
+        return scheme.lower() == "bearer" and hmac.compare_digest(presented, token_bytes)
+
+    async def require_token(request: Request) -> None:
+        if not authenticated(request):
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
                 "jeton d'accès requis ou invalide (en-tête Authorization: Bearer <token>)",
@@ -302,9 +397,17 @@ def create_app(
 
     # ------------------------------------------------------------- health
     @app.get("/health", response_model=S.HealthOut)
-    def health() -> S.HealthOut:
-        """État du service, du backend par défaut et des bases de savoir."""
+    def health(request: Request) -> S.HealthOut:
+        """État du service, du backend par défaut et des bases de savoir.
+        Sans jeton : état minimal (ni détail du backend, ni appel sortant)."""
         backend_name = settings.backends.default
+        if not authenticated(request):
+            return S.HealthOut(
+                status="ok",
+                version=__version__,
+                backend=S.BackendHealth(name=str(backend_name), model="", health={}),
+                kb=S.KBHealth(),
+            )
         model = getattr(getattr(settings.backends, backend_name, None), "model", "")
         backend_health: dict[str, Any]
         try:
@@ -404,9 +507,20 @@ def create_app(
     @router.post("/kb/{name}/documents", response_model=S.IngestReportOut)
     def kb_add_documents(name: str, body: S.DocumentsAdd) -> S.IngestReportOut:
         """Ingère fichiers, dossiers et URLs ; les chemins refusés par la
-        politique d'accès sont comptés en échec (jamais lus)."""
+        politique d'accès sont comptés en échec (jamais lus). Un dossier est
+        parcouru ici (``iter_files``) pour soumettre chacun de ses fichiers à
+        ``check_read`` : les motifs ``tools.deny_patterns`` s'appliquent aussi
+        au contenu des dossiers, pas seulement à la source de premier niveau."""
         allowed: list[str] = []
         denied: list[str] = []
+
+        def screen(candidate: str | Path) -> bool:
+            decision = policy.check_read(candidate)
+            if decision.allowed:
+                return True
+            denied.append(f"{candidate} : {decision.reason or 'lecture refusée'}")
+            return False
+
         for raw in body.sources:
             source = str(raw).strip()
             if not source:
@@ -414,11 +528,17 @@ def create_app(
             if source.startswith(("http://", "https://")):
                 allowed.append(source)
                 continue
-            decision = policy.check_read(source)
-            if decision.allowed:
-                allowed.append(source)
+            if not screen(source):
+                continue
+            path = Path(source).expanduser()
+            try:
+                path = path.resolve()
+            except OSError:
+                path = path.absolute()
+            if path.is_dir():
+                allowed.extend(str(f) for f in iter_files(path, body.recursive, settings) if screen(f))
             else:
-                denied.append(f"{source} : {decision.reason or 'lecture refusée'}")
+                allowed.append(source)
         with kb_lock, _kb_errors():
             info = require_base(name)
             manager = current_kb()
@@ -471,10 +591,19 @@ def create_app(
         """Un tour d'agent : JSON complet (``stream=false``) ou flux SSE."""
         backend = build_backend(body.backend, body.model)
         store = SessionStore(settings)
-        if body.session_id is None:
+        created = body.session_id is None
+        if created:
             session = store.create(backend=backend.name, model=backend.model)
         else:
             session = load_session(store, body.session_id)
+
+        def release(*, failed: bool = False) -> None:
+            """Libère la session ; après un échec, une session créée par cet
+            appel et restée vide est supprimée (aucun fichier orphelin)."""
+            session_locks.release(session.id)
+            if failed and created and not session.messages:
+                with contextlib.suppress(Exception):
+                    store.delete(session.id)
 
         if not session_locks.acquire(session.id):
             raise HTTPException(status.HTTP_409_CONFLICT, f"session occupée : {session.id}")
@@ -488,17 +617,19 @@ def create_app(
                 tools=not body.no_tools,
             )
         except Exception:
-            session_locks.release(session.id)
+            release(failed=True)
             raise
 
         if not body.stream:
+            failed = True
             try:
                 result = runtime.agent.run(body.message)
+                failed = False
             except Exception as e:  # noqa: BLE001
                 log.exception("échec de l'agent (session %s)", session.id)
                 raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"échec de l'agent : {e}") from e
             finally:
-                session_locks.release(session.id)
+                release(failed=failed)
             return S.ChatOut(
                 text=result.text,
                 session_id=session.id,
@@ -512,10 +643,11 @@ def create_app(
         events: "queue.Queue[Any]" = queue.Queue()
 
         def worker() -> None:
+            failed = True
             try:
-                run_agent_to_queue(runtime.agent, session.id, body.message, events)
+                failed = not run_agent_to_queue(runtime.agent, session.id, body.message, events)
             finally:
-                session_locks.release(session.id)
+                release(failed=failed)
 
         threading.Thread(target=worker, name=f"dhaos-chat-{session.id}", daemon=True).start()
         return StreamingResponse(
@@ -578,16 +710,24 @@ def main() -> None:
     import uvicorn
 
     settings = Settings.load()
-    uvicorn.run(create_app(settings), host=settings.api.host, port=settings.api.port)
+    application = create_app(settings)
+    if application.state.token_generated:
+        print(f"jeton d'accès (api.token absent) : {application.state.token}", file=sys.stderr)
+    uvicorn.run(application, host=settings.api.host, port=settings.api.port)
 
 
 __all__ = [
     "BackendFactory",
+    "HostOriginGuard",
     "KBFactory",
+    "LOCAL_HOSTS",
     "MASK",
     "SECRET_KEYS",
     "SessionLocks",
+    "allowed_hosts_for",
     "create_app",
+    "host_name",
+    "normalize_origin",
     "default_backend_factory",
     "default_kb_factory",
     "iter_sse",

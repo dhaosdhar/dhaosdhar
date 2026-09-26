@@ -584,3 +584,16 @@ def test_list_dir_marks_protected_files(registry: ToolRegistry, ctx: ToolContext
     assert any(line.startswith("f .env  ") and "protégé" in line for line in lines)
     assert any(line.startswith("f server.pem  ") and "protégé" in line for line in lines)
     assert any(line.startswith("f README.md  ") and "protégé" not in line for line in lines)
+
+
+# Régression : les schémas des outils disque acceptaient des propriétés
+# inconnues (typo d'argument masquée, ex. startLine au lieu de start_line).
+def test_tools_reject_extra_args(settings: Settings, registry: ToolRegistry, ctx: ToolContext, tree: Path) -> None:
+    for t in filesystem.tools(settings):
+        assert t.parameters.get("additionalProperties") is False, t.name
+    r = run(registry, ctx, "read_file", path="README.md", bogus=1)
+    assert r.is_error and "INVALID_JSON" in r.content and "Additional properties" in r.content
+    r = run(registry, ctx, "read_file", path="src/main.py", startLine=2, endLine=3)
+    assert r.is_error and "startLine" in r.content
+    r = run(registry, ctx, "write_file", path="new.txt", content="x", mode="append")
+    assert r.is_error and not (tree / "new.txt").exists()

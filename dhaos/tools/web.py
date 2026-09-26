@@ -10,20 +10,29 @@ ingérer des URLs) :
 
 Sécurité : les URLs viennent du modèle et sont **non fiables**. Seuls les
 schémas ``http``/``https`` sont acceptés ; l'hôte est résolu et refusé s'il
-pointe vers une adresse interne (boucle locale, réseaux privés, lien-local,
-``0.0.0.0``, ``localhost``), y compris à chaque redirection (garde anti-SSRF).
-La lecture est plafonnée à ``MAX_FETCH_BYTES`` octets, puis tronquée à
+pointe vers une adresse interne ou non globale (boucle locale, réseaux privés,
+lien-local, CGNAT ``100.64.0.0/10``, ``0.0.0.0``, ``localhost``…), y compris à
+chaque redirection (garde anti-SSRF). La connexion est **épinglée** sur
+l'adresse IP validée (URL de connexion par IP, en-tête ``Host`` et SNI portant
+le nom d'hôte) afin qu'une seconde résolution DNS divergente (rebinding) ne
+puisse pas contourner la garde. La lecture est plafonnée à ``MAX_FETCH_BYTES``
+octets **avant et après** décompression (gzip/deflate décodés par tranches
+bornées), l'ensemble du téléchargement est soumis à une échéance globale
+(``web.timeout × FETCH_TIME_BUDGET_FACTOR``), puis le texte est tronqué à
 ``web.fetch_max_chars`` caractères.
 """
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import re
 import socket
+import time
+import zlib
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -35,6 +44,13 @@ from .base import Tool, ToolContext, ToolError, ToolResult
 MAX_FETCH_BYTES = 5_000_000
 # Nombre maximal de redirections suivies (chaque saut repasse par la garde).
 MAX_REDIRECTS = 10
+# Échéance globale d'un téléchargement (redirections et lecture comprises),
+# en multiples de ``web.timeout`` qui, lui, ne borne que chaque opération.
+FETCH_TIME_BUDGET_FACTOR = 3
+# Taille des tranches lues sur le réseau (octets compressés).
+_RAW_CHUNK = 65_536
+# Encodages de contenu décodés ici, par tranches bornées.
+_SUPPORTED_ENCODINGS = frozenset({"", "identity", "gzip", "x-gzip", "deflate"})
 # Plafond absolu du nombre de résultats de recherche.
 MAX_SEARCH_RESULTS = 50
 
@@ -109,14 +125,18 @@ def _clean_str(value: Any) -> str:
 
 
 def _is_internal_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified:
-        return True
-    if ip.is_multicast or ip.is_reserved:
-        return True
     # IPv6 encapsulant une IPv4 (::ffff:10.0.0.1) : on juge l'adresse IPv4.
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         return _is_internal_ip(mapped)
+    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified:
+        return True
+    if ip.is_multicast or ip.is_reserved:
+        return True
+    # Tout ce qui n'est pas routable publiquement : CGNAT 100.64.0.0/10
+    # (RFC 6598, Tailscale…), 192.0.0.0/24, 198.18.0.0/15, 240.0.0.0/4…
+    if not ip.is_global:
+        return True
     return False
 
 
@@ -142,6 +162,12 @@ def check_url(url: str) -> str:
     Lève ``ToolError`` si le schéma n'est pas http/https, si l'hôte manque ou
     s'il désigne une adresse interne (garde anti-SSRF).
     """
+    return _validate_url(url)[0]
+
+
+def _validate_url(url: str) -> tuple[str, str, list[str]]:
+    """Comme ``check_url`` mais renvoie ``(url, hôte, adresses IP validées)``
+    afin que la connexion puisse être épinglée sur une adresse vérifiée."""
     if not isinstance(url, str) or not url.strip():
         raise ToolError("URL vide")
     url = url.strip()
@@ -169,6 +195,7 @@ def check_url(url: str) -> str:
         candidates = resolve_host(host)
     else:
         candidates = [str(ip)]
+    addresses: list[str] = []
     for candidate in candidates:
         try:
             resolved = ipaddress.ip_address(candidate.split("%", 1)[0])
@@ -176,7 +203,32 @@ def check_url(url: str) -> str:
             raise ToolError(f"adresse interne refusée : {host} ({candidate})") from None
         if _is_internal_ip(resolved):
             raise ToolError(f"adresse interne refusée : {host} ({resolved})")
-    return url
+        if str(resolved) not in addresses:
+            addresses.append(str(resolved))
+    return url, host, addresses
+
+
+def _pinned_url(url: str, ip: str) -> str:
+    """URL de connexion où l'hôte est remplacé par l'adresse IP validée
+    (port et identifiants conservés, IPv6 entre crochets, fragment retiré)."""
+    parts = urlsplit(url)
+    literal = f"[{ip}]" if ":" in ip else ip
+    netloc = literal
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    if parts.username is not None:
+        creds = parts.username if parts.password is None else f"{parts.username}:{parts.password}"
+        netloc = f"{creds}@{netloc}"
+    return urlunsplit((parts.scheme.lower(), netloc, parts.path or "/", parts.query, ""))
+
+
+def _host_header(url: str) -> str:
+    """Valeur de l'en-tête ``Host`` pour l'URL nominale (``hôte[:port]``)."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{parts.port}" if parts.port is not None else host
 
 
 def _normalize_lines(text: str) -> str:
@@ -262,21 +314,100 @@ def _sniff_type(data: bytes) -> str:
     return "application/octet-stream"
 
 
-def _read_body(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
-    """Lit au plus ``limit`` octets ; renvoie ``(données, tronqué)``."""
+def _content_encoding(response: httpx.Response) -> str:
+    return response.headers.get("content-encoding", "").strip().lower()
+
+
+class _BoundedDecoder:
+    """Décodeur gzip/deflate incrémental dont la sortie est bornée à chaque
+    appel (``max_length``) : un fragment réseau très compressible ne peut pas
+    faire allouer plus que le plafond restant."""
+
+    def __init__(self, encoding: str) -> None:
+        self.encoding = encoding
+        self._raw_deflate_tried = False
+        if encoding in ("gzip", "x-gzip"):
+            self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        else:
+            self._obj = zlib.decompressobj()
+        self.pending = b""  # entrée compressée non encore consommée
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
+        data = self.pending + data
+        try:
+            out = self._obj.decompress(data, max_length)
+        except zlib.error:
+            # deflate « brut » (sans en-tête zlib) : on retente une fois.
+            if self.encoding != "deflate" or self._raw_deflate_tried:
+                raise
+            self._raw_deflate_tried = True
+            self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
+            out = self._obj.decompress(data, max_length)
+        self.pending = self._obj.unconsumed_tail
+        return out
+
+
+def _raw_chunks(response: httpx.Response):
+    """Octets **bruts** (non décodés) de la réponse, tranche réseau par
+    tranche réseau (au plus 64 Ko chez httpcore), sans regroupement — sinon
+    l'échéance globale ne serait vérifiée qu'une fois 64 Ko accumulés. Une
+    réponse dont le corps est déjà chargé en mémoire
+    (``httpx.Response(content=...)``, cas des doubles de test) est servie
+    depuis ce contenu par tranches de ``_RAW_CHUNK`` ; httpx l'a alors déjà
+    décodé, voir ``_preloaded``."""
+    if _preloaded(response):
+        return response.iter_bytes(_RAW_CHUNK)
+    return response.iter_raw()
+
+
+def _preloaded(response: httpx.Response) -> bool:
+    """Vrai si le corps a été chargé (et décodé) par httpx à la construction."""
+    return bool(response.is_stream_consumed)
+
+
+def _check_deadline(deadline: float | None, budget: float) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise ToolError(f"récupération impossible : délai global dépassé ({budget:g}s)")
+
+
+def _read_body(response: httpx.Response, limit: int, *, deadline: float | None = None,
+               budget: float = 0.0) -> tuple[bytes, bool]:
+    """Lit au plus ``limit`` octets (compressés **et** décompressés) ; renvoie
+    ``(données, tronqué)``. Vérifie l'échéance globale à chaque tranche."""
+    encoding = "" if _preloaded(response) else _content_encoding(response)
+    if encoding not in _SUPPORTED_ENCODINGS:
+        raise ToolError(f"encodage de contenu non pris en charge : {encoding}")
+    decoder = _BoundedDecoder(encoding) if encoding in ("gzip", "x-gzip", "deflate") else None
     buf = bytearray()
+    raw_total = 0
     truncated = False
-    chunks = iter(response.iter_bytes())
+    chunks = iter(_raw_chunks(response))
     for chunk in chunks:
+        _check_deadline(deadline, budget)
         if not chunk:
             continue
+        raw_total += len(chunk)
         remaining = limit - len(buf)
-        if len(chunk) < remaining:
-            buf += chunk
+        if decoder is not None:
+            try:
+                # On demande un octet de plus que le reste pour détecter le débordement.
+                data = decoder.decompress(chunk, remaining + 1)
+            except zlib.error as e:
+                raise ToolError(f"récupération impossible : contenu {encoding} corrompu ({e})") from e
+        else:
+            data = chunk
+        if len(data) <= remaining and raw_total <= limit and not (decoder is not None and decoder.pending):
+            buf += data
             continue
-        buf += chunk[:remaining]
-        # Plafond atteint : tronqué si ce chunk débordait ou s'il reste des données.
-        truncated = len(chunk) > remaining or any(c for c in chunks)
+        buf += data[:remaining]
+        # Plafond atteint (sortie, entrée compressée ou reliquat non consommé) :
+        # tronqué si des données débordent ou s'il en reste à lire.
+        truncated = (
+            len(data) > remaining
+            or bool(decoder is not None and decoder.pending)
+            or raw_total > limit
+            or any(c for c in chunks)
+        )
         break
     return bytes(buf), truncated
 
@@ -396,23 +527,45 @@ def web_search(
 
 
 # ---------------------------------------------------------------- lecture
-def _fetch_raw(settings: Settings, url: str, client: httpx.Client) -> tuple[httpx.Response, bytes, bool]:
-    """GET avec redirections manuelles (garde anti-SSRF à chaque saut) et
-    lecture plafonnée. Renvoie ``(réponse finale, corps, tronqué)``."""
-    current = check_url(url)
-    headers = _request_headers(settings, Accept="text/html,application/xhtml+xml,text/plain,application/pdf,*/*;q=0.5")
+def _fetch_raw(settings: Settings, url: str, client: httpx.Client) -> tuple[httpx.Response, bytes, bool, str]:
+    """GET avec redirections manuelles (garde anti-SSRF à chaque saut),
+    connexion épinglée sur l'adresse validée, lecture plafonnée et échéance
+    globale. Renvoie ``(réponse finale, corps, tronqué, URL nominale finale)``."""
+    per_op = float(settings.web.timeout)
+    budget = per_op * FETCH_TIME_BUDGET_FACTOR
+    deadline = time.monotonic() + budget
+    current, host, addresses = _validate_url(url)
+    base_headers = _request_headers(
+        settings,
+        Accept="text/html,application/xhtml+xml,text/plain,application/pdf,*/*;q=0.5",
+        **{"Accept-Encoding": "gzip, deflate"},
+    )
     for _ in range(MAX_REDIRECTS + 1):
+        _check_deadline(deadline, budget)
+        headers = dict(base_headers, Host=_host_header(current))
+        extensions = {"sni_hostname": host}
         try:
-            with client.stream("GET", current, headers=headers, follow_redirects=False,
-                               timeout=settings.web.timeout) as response:
+            for i, ip in enumerate(addresses):
+                op_timeout = min(per_op, max(0.01, deadline - time.monotonic()))
+                request = client.build_request("GET", _pinned_url(current, ip), headers=headers,
+                                               extensions=extensions, timeout=op_timeout)
+                try:
+                    response = client.send(request, stream=True, follow_redirects=False)
+                except httpx.ConnectError:
+                    # Adresse injoignable : on essaie la suivante (toutes sont validées).
+                    if i == len(addresses) - 1:
+                        raise
+                    continue
+                break
+            with contextlib.closing(response):
                 if response.status_code in _REDIRECT_CODES and response.headers.get("location"):
-                    target = urljoin(str(response.url), response.headers["location"])
-                    current = check_url(target)
+                    target = urljoin(current, response.headers["location"])
+                    current, host, addresses = _validate_url(target)
                     continue
                 if response.status_code >= 400:
                     raise ToolError(f"HTTP {response.status_code} pour {current}")
-                body, truncated = _read_body(response, MAX_FETCH_BYTES)
-                return response, body, truncated
+                body, truncated = _read_body(response, MAX_FETCH_BYTES, deadline=deadline, budget=budget)
+                return response, body, truncated, current
         except ToolError:
             raise
         except httpx.HTTPError as e:
@@ -438,12 +591,11 @@ def fetch_page(
     max_chars = max(1, int(max_chars))
 
     if client is not None:
-        response, body, truncated_bytes = _fetch_raw(settings, url, client)
+        response, body, truncated_bytes, final_url = _fetch_raw(settings, url, client)
     else:
         with _own_client(settings) as own:
-            response, body, truncated_bytes = _fetch_raw(settings, url, own)
+            response, body, truncated_bytes, final_url = _fetch_raw(settings, url, own)
 
-    final_url = str(response.url)
     mime, charset = _split_content_type(response.headers.get("content-type", ""))
     if not mime or mime == "application/octet-stream":
         mime = _sniff_type(body)
@@ -458,12 +610,14 @@ def fetch_page(
     else:
         raise ToolError(f"type non pris en charge : {mime} ({final_url})")
 
+    text = truncate(text, max_chars)
     if truncated_bytes:
+        # Après la troncature en caractères, pour que le marqueur survive.
         text += f"\n… [lecture arrêtée à {MAX_FETCH_BYTES} octets]"
     return PageContent(
         url=final_url,
         title=title,
-        text=truncate(text, max_chars),
+        text=text,
         content_type=mime,
         status=response.status_code,
     )
@@ -549,6 +703,7 @@ def tools(settings: Settings) -> list[Tool]:
 
 
 __all__ = [
+    "FETCH_TIME_BUDGET_FACTOR",
     "MAX_FETCH_BYTES",
     "MAX_REDIRECTS",
     "MAX_SEARCH_RESULTS",

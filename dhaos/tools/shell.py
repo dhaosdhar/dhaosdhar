@@ -2,14 +2,17 @@
 
 ``run_command`` exécute ``/bin/bash -c <commande>`` dans un répertoire de
 travail lisible (``check_read``), après ``check_command`` (liste blanche ou
-confirmation via ``ctx.confirm``), avec un délai maximal
-(``tools.command_timeout``), un environnement expurgé des variables sensibles
-(clés, jetons, secrets, mots de passe) et une sortie tronquée. Chaque
-exécution est journalisée (``ctx.journal``).
+confirmation via ``ctx.confirm`` ; une commande en liste blanche dont un
+argument désigne un chemin protégé — secrets, clés — ou une option d'écriture
+repasse en confirmation), avec un délai maximal (``tools.command_timeout``),
+un environnement expurgé des variables sensibles (clés, jetons, secrets, mots
+de passe, sockets d'agent SSH/GPG, URL avec identifiants) et une sortie
+tronquée. Chaque exécution est journalisée (``ctx.journal``).
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -23,12 +26,29 @@ from .base import Tool, ToolContext, ToolError, ToolResult
 
 # Fragments de noms de variables d'environnement jamais transmis aux commandes.
 SENSITIVE_ENV_FRAGMENTS: tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+# Variables jamais transmises quel que soit leur nom : accès aux agents SSH / GPG.
+SENSITIVE_ENV_NAMES: tuple[str, ...] = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO")
+# Valeur ressemblant à une URL porteuse d'identifiants (``schéma://user:mdp@hôte``),
+# forme usuelle de DATABASE_URL, REDIS_URL, *_DSN…
+CREDENTIAL_URL_RE = re.compile(r"^\s*[a-z][a-z0-9+.-]*://[^/@\s]*:[^/@\s]+@", re.IGNORECASE)
+
+
+def is_sensitive_env(name: str, value: str) -> bool:
+    """Vrai si la variable ne doit pas être transmise aux commandes.
+
+    Le nom évoque un secret (``SENSITIVE_ENV_FRAGMENTS``), désigne un agent
+    (``SENSITIVE_ENV_NAMES``), ou la valeur est une URL avec identifiants.
+    """
+    upper = name.upper()
+    if upper in SENSITIVE_ENV_NAMES or any(frag in upper for frag in SENSITIVE_ENV_FRAGMENTS):
+        return True
+    return bool(CREDENTIAL_URL_RE.match(value))
 
 
 def scrub_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Copie de l'environnement sans les variables dont le nom évoque un secret."""
+    """Copie de l'environnement sans les variables sensibles (voir ``is_sensitive_env``)."""
     source = os.environ if environ is None else environ
-    return {k: v for k, v in source.items() if not any(frag in k.upper() for frag in SENSITIVE_ENV_FRAGMENTS)}
+    return {k: v for k, v in source.items() if not is_sensitive_env(k, v)}
 
 
 def _bash_path() -> str:
@@ -77,6 +97,7 @@ class RunCommandTool(Tool):
             "timeout": {"type": "number", "exclusiveMinimum": 0, "description": "Délai maximal en secondes."},
         },
         "required": ["command"],
+        "additionalProperties": False,
     }
     may_require_confirmation = True
 
@@ -101,7 +122,7 @@ class RunCommandTool(Tool):
             raise ToolError(f"commande refusée : répertoire de travail introuvable : {cwd}")
 
         # Politique de commande et confirmation.
-        decision = ctx.policy.check_command(command)
+        decision = ctx.policy.check_command(command, cwd=cwd)
         if not decision.allowed:
             raise ToolError(f"commande refusée : {decision.reason}")
         confirmed = False
@@ -175,4 +196,5 @@ def tools(settings: Settings) -> list[Tool]:
     return [RunCommandTool()]
 
 
-__all__ = ["RunCommandTool", "SENSITIVE_ENV_FRAGMENTS", "scrub_env", "tools"]
+__all__ = ["CREDENTIAL_URL_RE", "RunCommandTool", "SENSITIVE_ENV_FRAGMENTS", "SENSITIVE_ENV_NAMES",
+           "is_sensitive_env", "scrub_env", "tools"]

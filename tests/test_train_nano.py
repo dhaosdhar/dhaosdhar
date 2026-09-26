@@ -27,7 +27,7 @@ from dhaos.train.nano.train import (  # noqa: E402
     train_nano,
     validate_name,
 )
-from dhaos.train.tokenizer import EOT_ID, N_BASE  # noqa: E402
+from dhaos.train.tokenizer import DOC_ID, DOC_TOKEN, EOT_ID, EOT_TOKEN, N_BASE  # noqa: E402
 
 TINY: dict[str, Any] = {
     "n_layer": 1,
@@ -253,3 +253,95 @@ def test_sample_stops_at_end_of_text(settings: Settings, corpus: Path, monkeypat
 
     monkeypatch.setattr(GPT, "generate", fake_generate)
     assert sample(report.out_dir, "dis ", max_new_tokens=4) == "dis ok"
+
+
+# ---------------------------------------------------------------- régressions
+def test_train_nano_refuses_to_overwrite_existing_model(settings: Settings, corpus: Path) -> None:
+    """Un second entraînement sous le même nom ne doit pas écraser le modèle
+    précédent sans ``overwrite=True``, et doit échouer avant tout calcul."""
+    overrides = {**TINY, "steps": 1}
+    first = train_nano(settings, corpus, name="mini", overrides=overrides, device="cpu")
+    model_bytes = (first.out_dir / MODEL_FILE).read_bytes()
+    config_text = (first.out_dir / CONFIG_FILE).read_text(encoding="utf-8")
+
+    lines: list[str] = []
+    with pytest.raises(FileExistsError, match="--force"):
+        train_nano(settings, corpus, name="mini", overrides={**overrides, "n_embd": 16}, on_log=lines.append, device="cpu")
+    assert lines == []  # refus avant l'entraînement
+    assert (first.out_dir / MODEL_FILE).read_bytes() == model_bytes
+    assert (first.out_dir / CONFIG_FILE).read_text(encoding="utf-8") == config_text
+
+    second = train_nano(settings, corpus, name="mini", overrides={**overrides, "n_embd": 16}, device="cpu", overwrite=True)
+    assert second.out_dir == first.out_dir
+    info = json.loads((first.out_dir / CONFIG_FILE).read_text(encoding="utf-8"))
+    assert info["model"]["n_embd"] == 16
+
+
+def test_cli_train_nano_requires_force_to_overwrite(settings: Settings, corpus: Path, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from dhaos.cli.main import app
+
+    cfg = settings.save(tmp_path / "config.toml")
+    runner = CliRunner()
+    args = [
+        "--config", str(cfg), "train", "nano", str(corpus), "--name", "mini",
+        "--steps", "1", "--n-layer", "1", "--n-head", "1", "--n-embd", "8", "--block-size", "8", "--batch-size", "2",
+    ]
+    first = runner.invoke(app, args)
+    assert first.exit_code == 0, first.output
+    model_path = settings.models_dir / "mini" / MODEL_FILE
+    model_bytes = model_path.read_bytes()
+
+    again = runner.invoke(app, args)
+    assert again.exit_code != 0
+    assert "--force" in again.output
+    assert model_path.read_bytes() == model_bytes
+
+    forced = runner.invoke(app, [*args, "--force"])
+    assert forced.exit_code == 0, forced.output
+
+
+def test_sample_stops_at_document_separator(settings: Settings, corpus: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Le corpus sépare les documents par ``<|doc|>`` (jamais ``<|endoftext|>``) :
+    la génération doit s'arrêter là aussi, sans restituer le séparateur."""
+    report = train_nano(settings, corpus, name="doc", overrides={**TINY, "steps": 1}, device="cpu")
+
+    def fake_generate(self: Any, idx: Any, max_new_tokens: int, temperature: float = 1.0, top_k: Any = None) -> Any:
+        extra = torch.tensor([[ord("o"), ord("k"), DOC_ID, ord("z"), EOT_ID]], dtype=torch.long)
+        return torch.cat([idx, extra], dim=1)
+
+    monkeypatch.setattr(GPT, "generate", fake_generate)
+    assert sample(report.out_dir, "dis ", max_new_tokens=5) == "dis ok"
+
+
+def test_sample_never_emits_document_separator_end_to_end(settings: Settings, tmp_path: Path) -> None:
+    """Corpus réel (``build_corpus`` sur des documents séparés par ``<|doc|>``)
+    → entraînement → échantillonnage : le séparateur ne doit jamais apparaître."""
+    from dhaos.train.dataset import build_corpus
+
+    class FakeKB:
+        def corpus_text(self, bases: Any) -> list[str]:
+            return [f"doc {i} contenu court." for i in range(120)]
+
+        def close(self) -> None:
+            pass
+
+    corpus_path = build_corpus(settings, out_path=tmp_path / "docs.txt", include_sessions=False, kb=FakeKB())
+    text = corpus_path.read_text(encoding="utf-8")
+    assert DOC_TOKEN in text and EOT_TOKEN not in text
+
+    report = train_nano(
+        settings, corpus_path, name="docs",
+        overrides={**TINY, "steps": 30, "tokenizer": "bpe", "bpe_vocab_size": 300}, device="cpu",
+    )
+    model, tokenizer, _ = nano_train.load_model(report.out_dir)
+    # Le modèle produit bien DOC_ID dans sa génération brute sur ce corpus...
+    ids = tokenizer.encode("doc 1 contenu court.")
+    raw = model.generate(torch.tensor([ids]), 40, temperature=1.0, top_k=None)[0].tolist()
+    assert len(raw) > len(ids)
+    # ... mais ``sample`` ne le restitue jamais, quel que soit le tirage.
+    for temperature in (0.0, 0.8, 1.5):
+        for _ in range(3):
+            out = sample(report.out_dir, "doc 1 contenu court.", max_new_tokens=40, temperature=temperature)
+            assert DOC_TOKEN not in out and EOT_TOKEN not in out

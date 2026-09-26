@@ -5,7 +5,8 @@
 taux d'apprentissage cosinus (warmup 5 %), évalue la validation dix fois au
 cours de l'entraînement et sauvegarde dans ``settings.models_dir/<nom>/`` :
 ``model.pt`` (state_dict), ``config.json`` (configuration + informations
-d'entraînement) et ``tokenizer.json``.
+d'entraînement) et ``tokenizer.json``. Un modèle existant du même nom n'est jamais écrasé
+sans ``overwrite=True`` (``FileExistsError``).
 
 ``sample`` recharge un modèle sauvegardé sur CPU et génère du texte.
 
@@ -29,7 +30,7 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from ...config import NanoConfig, Settings
-from ..tokenizer import EOT_ID, BPETokenizer, ByteTokenizer, get_tokenizer, load_tokenizer
+from ..tokenizer import DOC_ID, EOT_ID, BPETokenizer, ByteTokenizer, get_tokenizer, load_tokenizer
 
 LogCallback = Callable[[str], None]
 
@@ -165,15 +166,20 @@ def train_nano(
     overrides: dict[str, Any] | None = None,
     on_log: LogCallback | None = None,
     device: str | None = None,
+    overwrite: bool = False,
 ) -> TrainReport:
     """Entraîne un modèle nano sur ``corpus_path`` et le sauvegarde dans
     ``settings.models_dir/<name>/``. ``device`` : ``None`` ⇒ cuda si
-    disponible sinon cpu."""
+    disponible sinon cpu. Si un modèle existe déjà sous ce nom, lève
+    ``FileExistsError`` avant tout calcul, sauf ``overwrite=True``."""
     torch = _import_torch()
     from .model import GPT, GPTConfig
 
     name = validate_name(name)
     cfg, seed = resolve_config(settings, overrides)
+    out_dir = settings.models_dir / name
+    if (out_dir / MODEL_FILE).exists() and not overwrite:
+        raise FileExistsError(f"un modèle nano existe déjà dans {out_dir} (utilisez --force pour l'écraser)")
     corpus = Path(corpus_path)
     if not corpus.is_file():
         raise FileNotFoundError(f"corpus introuvable : {corpus}")
@@ -257,7 +263,6 @@ def train_nano(
             _log(on_log, f"étape {step + 1}/{steps} : perte {final_loss:.4f}, validation {val_loss:.4f}, lr {lr:.2e}")
     duration = time.perf_counter() - t0
 
-    out_dir = settings.models_dir / name
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, out_dir / MODEL_FILE)
@@ -334,7 +339,8 @@ def sample(
     """Génère la suite de ``prompt`` avec un modèle nano sauvegardé (CPU).
 
     Renvoie ``prompt + continuation`` ; la génération s'arrête au premier
-    ``<|endoftext|>``.
+    token spécial (``<|endoftext|>`` ou ``<|doc|>``, séparateur de
+    documents du corpus), qui n'est pas restitué.
     """
     torch = _import_torch()
     max_new_tokens = int(max_new_tokens)
@@ -356,8 +362,9 @@ def sample(
     with torch.no_grad():
         out = model.generate(idx, max_new_tokens, temperature=temperature, top_k=top_k)
     generated = out[0].tolist()[len(ids) :]
-    if EOT_ID in generated:
-        generated = generated[: generated.index(EOT_ID)]
+    stops = [i for i, token_id in enumerate(generated) if token_id in (EOT_ID, DOC_ID)]
+    if stops:
+        generated = generated[: stops[0]]
     return prompt + tokenizer.decode(generated)
 
 

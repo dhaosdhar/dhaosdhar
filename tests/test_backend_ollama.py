@@ -199,8 +199,9 @@ def test_chat_tool_calls_parsing_and_ids(settings: Settings) -> None:
     resp = backend.chat([Message("user", "lis a.py")], tools=[TOOL])
 
     assert resp.stop_reason == "tool_use"
-    assert [c.id for c in resp.tool_calls] == ["call_1", "call_2", "call_3"]
-    assert resp.tool_calls[0] == ToolCall("call_1", "read_file", {"path": "a.py"})
+    ids = [c.id for c in resp.tool_calls]
+    assert len(ids) == 3 and len(set(ids)) == 3 and all(i.startswith("call_") for i in ids)
+    assert resp.tool_calls[0] == ToolCall(ids[0], "read_file", {"path": "a.py"})
     assert resp.tool_calls[1].arguments == {"pattern": "TODO"}
     assert resp.tool_calls[2].arguments == {"_raw": "{pas du json"}
     assert resp.raw["tool_calls"] == [
@@ -379,3 +380,101 @@ def test_healthcheck_unreachable(settings: Settings) -> None:
         "detail": "Ollama injoignable sur http://127.0.0.1:11434 — lancez `ollama serve`",
         "models": [],
     }
+
+
+# ---------------------------------------------------------------- régressions : identifiants d'appel uniques
+
+
+def tool_turn(*names: str) -> Handler:
+    return chat_stream(
+        {"message": {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": n, "arguments": {}}} for n in names]}, "done": False},
+        done_chunk(),
+    )
+
+
+def test_tool_call_ids_unique_across_turns_and_backends(settings: Settings) -> None:
+    backend, _ = make_backend(settings, tool_turn("read_file", "grep"))
+    first = {c.id for c in backend.chat([Message("user", "a")]).tool_calls}
+    second = {c.id for c in backend.chat([Message("user", "b")]).tool_calls}
+    other, _ = make_backend(settings, tool_turn("read_file", "grep"))
+    third = {c.id for c in other.chat([Message("user", "c")]).tool_calls}
+    assert len(first) == len(second) == len(third) == 2
+    assert first.isdisjoint(second) and first.isdisjoint(third) and second.isdisjoint(third)
+
+
+def test_ollama_history_replays_on_claude_without_duplicate_ids(settings: Settings) -> None:
+    """Session Ollama à deux tours d'outils poursuivie sur Claude (`/backend claude`)."""
+    from dhaos.backends.claude import ClaudeBackend
+
+    backend, _ = make_backend(settings, tool_turn("read_file", "grep"))
+    history: list[Message] = [Message("user", "q")]
+    for _ in range(2):
+        resp = backend.chat(history)
+        history.append(resp.to_assistant_message())
+        for call in resp.tool_calls:
+            history.append(Message("tool", "ok", tool_call_id=call.id, name=call.name))
+    history.append(Message("user", "fin"))
+
+    out = ClaudeBackend.to_claude_messages(history)
+    tool_use_ids = [b["id"] for m in out if m["role"] == "assistant" for b in m["content"] if b["type"] == "tool_use"]
+    result_ids = [
+        b["tool_use_id"] for m in out if m["role"] == "user" and isinstance(m["content"], list) for b in m["content"]
+    ]
+    assert len(tool_use_ids) == 4 and len(set(tool_use_ids)) == 4
+    assert set(result_ids) == set(tool_use_ids)
+
+
+# ---------------------------------------------------------------- régressions : flux interrompu / erreurs non textuelles
+
+
+def test_chat_stream_without_done_raises(settings: Settings) -> None:
+    backend, _ = make_backend(settings, chat_stream({"message": {"role": "assistant", "content": "début de rép"}, "done": False}))
+    with pytest.raises(BackendError, match="interrompu"):
+        backend.chat([Message("user", "salut")])
+
+
+def test_chat_empty_body_raises(settings: Settings) -> None:
+    backend, _ = make_backend(settings, chat_stream())
+    with pytest.raises(BackendError, match="interrompu"):
+        backend.chat([Message("user", "salut")])
+
+
+def test_chat_lines_after_done_are_ignored(settings: Settings) -> None:
+    handler = chat_stream(
+        {"message": {"role": "assistant", "content": "ok"}, "done": False},
+        done_chunk("stop", prompt=3, evals=1),
+        {"message": {"role": "assistant", "content": "parasite"}, "done": False},
+    )
+    backend, _ = make_backend(settings, handler)
+    resp = backend.chat([Message("user", "?")])
+    assert resp.text == "ok" and resp.usage.input_tokens == 3
+
+
+def test_truncated_stream_gives_agent_error_and_no_partial_message(settings: Settings, ctx) -> None:
+    from dhaos.agent.loop import Agent
+    from dhaos.agent.session import Session, SessionStore
+    from dhaos.tools.base import ToolRegistry
+
+    backend, _ = make_backend(settings, chat_stream({"message": {"content": "début"}, "done": False}))
+    session = SessionStore(settings).create(backend="ollama")
+    result = Agent(settings, backend, ToolRegistry([]), ctx, session=session).run("question")
+    assert result.stop_reason == "error" and "interrompu" in (result.error or "")
+    assert [m.role for m in Session.load(session.path).messages] == ["user"]
+
+
+@pytest.mark.parametrize("err", [{"message": "model requires more system memory"}, 42, ["boom"], True])
+def test_chat_inline_non_string_error_raises(settings: Settings, err: Any) -> None:
+    backend, _ = make_backend(settings, chat_stream({"error": err}))
+    with pytest.raises(BackendError, match="erreur Ollama") as info:
+        backend.chat([Message("user", "?")])
+    if isinstance(err, dict):
+        assert "model requires more system memory" in str(info.value)
+
+
+def test_status_error_with_non_string_error_body(settings: Settings) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "out of memory"}})
+
+    backend, _ = make_backend(settings, handler)
+    with pytest.raises(BackendError, match="HTTP 500 : .*out of memory"):
+        backend.chat([Message("user", "?")])

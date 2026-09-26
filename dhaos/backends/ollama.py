@@ -10,6 +10,7 @@ Toutes les données reçues sont considérées comme non fiables et validées.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 import httpx
@@ -19,6 +20,26 @@ from ..types import ChatResponse, Message, TextCallback, ToolCall, ToolSpec, Usa
 from .base import Backend, BackendError
 
 _ERR_PREFIX = "[erreur] "
+
+
+def _new_call_id() -> str:
+    """Identifiant d'appel d'outil unique (Ollama n'en fournit pas).
+
+    Unique par processus et entre sessions rechargées : un même historique
+    peut être poursuivi sur Claude, dont l'API exige des ids ``tool_use``
+    distincts.
+    """
+    return f"call_{uuid.uuid4().hex[:12]}"
+
+
+def _error_detail(err: Any) -> str:
+    """Texte d'un champ ``error`` renvoyé par Ollama, quelle que soit sa forme."""
+    if isinstance(err, str):
+        return err
+    try:
+        return json.dumps(err, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(err)
 
 
 def _strip_latest(name: str) -> str:
@@ -110,8 +131,8 @@ class OllamaBackend(Backend):
         detail = body.strip()
         try:
             parsed = json.loads(detail)
-            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
-                detail = parsed["error"]
+            if isinstance(parsed, dict) and parsed.get("error") is not None:
+                detail = _error_detail(parsed["error"])
         except (json.JSONDecodeError, ValueError):
             pass
         return BackendError(f"Ollama a renvoyé HTTP {status} : {detail[:2000]}")
@@ -155,6 +176,7 @@ class OllamaBackend(Backend):
         raw_tool_calls: list[dict[str, Any]] = []
         tool_calls: list[ToolCall] = []
         done_reason: str | None = None
+        done_seen = False
         usage = Usage()
         model_name = self.model
 
@@ -173,8 +195,8 @@ class OllamaBackend(Backend):
                         raise BackendError(f"flux Ollama invalide : ligne non JSON ({line[:120]!r})") from exc
                     if not isinstance(obj, dict):
                         raise BackendError("flux Ollama invalide : objet attendu")
-                    if isinstance(obj.get("error"), str):
-                        raise BackendError(f"erreur Ollama : {obj['error']}")
+                    if obj.get("error") is not None:
+                        raise BackendError(f"erreur Ollama : {_error_detail(obj['error'])[:2000]}")
 
                     if isinstance(obj.get("model"), str):
                         model_name = obj["model"]
@@ -200,18 +222,24 @@ class OllamaBackend(Backend):
                                     continue
                                 arguments = _parse_arguments(fn.get("arguments"))
                                 raw_tool_calls.append({"function": {"name": fn["name"], "arguments": arguments}})
-                                tool_calls.append(
-                                    ToolCall(id=f"call_{len(tool_calls) + 1}", name=fn["name"], arguments=arguments)
-                                )
+                                tool_calls.append(ToolCall(id=_new_call_id(), name=fn["name"], arguments=arguments))
                     if obj.get("done"):
+                        done_seen = True
                         dr = obj.get("done_reason")
                         done_reason = dr if isinstance(dr, str) else None
                         usage = Usage(
                             input_tokens=_as_int(obj.get("prompt_eval_count")),
                             output_tokens=_as_int(obj.get("eval_count")),
                         )
+                        break  # objet final : ignorer d'éventuelles lignes ultérieures
         except httpx.HTTPError as exc:
             raise self._network_error(exc) from exc
+        if not done_seen:
+            # Fin de flux propre sans objet final : la réponse est tronquée
+            # (runner arrêté, proxy qui coupe…) et ne doit pas passer pour complète.
+            raise BackendError(
+                "flux Ollama interrompu avant la fin de la réponse (objet final `done` absent) — relancez la requête"
+            )
 
         text = "".join(text_parts)
         raw: dict[str, Any] = {"role": "assistant", "content": text}

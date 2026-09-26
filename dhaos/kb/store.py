@@ -216,16 +216,25 @@ class Store:
         return self._all(self._DOC_SELECT + " WHERE d.base_id = ? ORDER BY d.source", (base_id,))
 
     def iter_document_texts(self, base_ids: Sequence[int]) -> Iterator[tuple[int, str]]:
-        """``(doc_id, texte)`` des documents des bases données (ordre : base, source)."""
+        """``(doc_id, texte)`` des documents des bases données (ordre : base, source).
+
+        Seule la liste des identifiants est chargée d'un bloc ; chaque texte est
+        lu à la demande, sans tenir le verrou entre deux itérations, pour ne pas
+        charger tout le corpus en mémoire."""
         if not base_ids:
             return
-        rows = self._all(
-            f"SELECT id, text FROM documents WHERE base_id IN ({_placeholders(len(base_ids))})"
-            " ORDER BY base_id, source",
-            tuple(base_ids),
-        )
-        for row in rows:
-            yield int(row["id"]), str(row["text"])
+        ids = [
+            int(r["id"])
+            for r in self._all(
+                f"SELECT id FROM documents WHERE base_id IN ({_placeholders(len(base_ids))})"
+                " ORDER BY base_id, source",
+                tuple(base_ids),
+            )
+        ]
+        for doc_id in ids:
+            row = self._one("SELECT text FROM documents WHERE id = ?", (doc_id,))
+            if row is not None:
+                yield doc_id, str(row["text"])
 
     def export_rows(self, base_id: int) -> list[sqlite3.Row]:
         return self._all(

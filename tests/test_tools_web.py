@@ -2,8 +2,12 @@
 sans réseau (httpx.MockTransport, DDGS factice, DNS simulé)."""
 from __future__ import annotations
 
+import gzip
 import socket
-from typing import Any, Callable
+import time
+import tracemalloc
+import zlib
+from typing import Any, Callable, Iterator
 
 import httpx
 import pytest
@@ -345,20 +349,26 @@ class TestFetchPage:
                 fetch_page(settings, "https://slow.example/", client=client)
 
     def test_redirect_followed(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
-        hops: list[str] = []
+        """Chaque saut est validé puis **épinglé** sur l'adresse résolue : la
+        connexion vise l'IP, l'en-tête Host et le SNI portent le nom nominal."""
+        hops: list[tuple[str, str, str]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            hops.append(str(request.url))
+            hops.append((str(request.url), request.headers["host"], request.extensions.get("sni_hostname", "")))
             if request.url.path == "/old":
                 return httpx.Response(302, headers={"location": "/new"})
             if request.url.path == "/new":
-                return httpx.Response(301, headers={"location": "https://other.example/final"})
+                return httpx.Response(301, headers={"location": "https://other.example:8443/final"})
             return httpx.Response(200, headers={"content-type": "text/plain"}, text="arrivé")
 
         with make_client(handler) as client:
             page = fetch_page(settings, "https://www.example.com/old", client=client)
-        assert hops == ["https://www.example.com/old", "https://www.example.com/new", "https://other.example/final"]
-        assert page.url == "https://other.example/final"
+        assert hops == [
+            (f"https://{PUBLIC_IP}/old", "www.example.com", "www.example.com"),
+            (f"https://{PUBLIC_IP}/new", "www.example.com", "www.example.com"),
+            (f"https://{PUBLIC_IP}:8443/final", "other.example:8443", "other.example"),
+        ]
+        assert page.url == "https://other.example:8443/final"
         assert page.text == "arrivé"
 
     def test_redirect_to_internal_refused(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
@@ -393,6 +403,16 @@ class TestFetchPage:
             page = fetch_page(settings, "https://big.example/", client=client)
         assert page.text == "b" * 100
 
+    def test_size_marker_survives_max_chars(self, settings: Settings, public_dns: Callable[[str], None],
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+        """Régression : le marqueur « lecture arrêtée » était ajouté avant la
+        troncature en caractères et disparaissait dès que max_chars était atteint."""
+        monkeypatch.setattr(web, "MAX_FETCH_BYTES", 100)
+        with make_client(lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"a" * 1000)) as client:
+            page = fetch_page(settings, "https://big.example/", max_chars=10, client=client)
+        assert page.text.startswith("a" * 10)
+        assert "caractères omis" in page.text and page.text.endswith("[lecture arrêtée à 100 octets]")
+
     def test_max_chars_truncation(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
         settings.web.fetch_max_chars = 10
         with make_client(lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, text="x" * 50)) as client:
@@ -420,6 +440,229 @@ class TestFetchPage:
         assert captured["headers"]["User-Agent"] == settings.web.user_agent
 
 
+# ------------------------------------------------- épinglage anti-rebinding
+def rebinding_dns(monkeypatch: pytest.MonkeyPatch, table: dict[str, list[str]]) -> dict[str, int]:
+    """DNS simulé : pour chaque nom, la n-ième résolution renvoie ``table[nom][n]``
+    (la dernière valeur se répète). Renvoie le compteur d'appels par nom."""
+    counts: dict[str, int] = {}
+
+    def fake_getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        answers = table.get(host)
+        if answers is None:
+            raise socket.gaierror(-2, f"inconnu : {host}")
+        n = counts.get(host, 0)
+        counts[host] = n + 1
+        ip = answers[min(n, len(answers) - 1)]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    return counts
+
+
+class TestSsrfPinning:
+    """Régression : ``check_url`` résolvait l'hôte puis httpx le résolvait à
+    nouveau à la connexion ; un DNS alterné (rebinding) faisait valider une
+    adresse publique et contacter une adresse interne."""
+
+    def test_connection_pinned_on_validated_address(self, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+        counts = rebinding_dns(monkeypatch, {"hote.test": [PUBLIC_IP, "127.0.0.1"]})
+        seen: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((request.url.host, request.headers["host"]))
+            if request.url.host == "127.0.0.1":
+                return httpx.Response(200, headers={"content-type": "text/plain"}, text="secret-interne")
+            return httpx.Response(200, headers={"content-type": "text/plain"}, text="public")
+
+        with make_client(handler) as client:
+            page = fetch_page(settings, "http://hote.test:8080/x?y=1", client=client)
+        assert counts == {"hote.test": 1}
+        assert seen == [(PUBLIC_IP, "hote.test:8080")]
+        assert page.text == "public" and page.url == "http://hote.test:8080/x?y=1"
+
+    def test_redirect_target_pinned_too(self, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+        counts = rebinding_dns(monkeypatch, {"a.test": [PUBLIC_IP], "b.test": ["93.184.216.35", "10.0.0.5"]})
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.host)
+            if request.headers["host"] == "a.test":
+                return httpx.Response(302, headers={"location": "http://b.test/admin"})
+            if request.url.host == "10.0.0.5":
+                return httpx.Response(200, headers={"content-type": "text/plain"}, text="secret-interne")
+            return httpx.Response(200, headers={"content-type": "text/plain"}, text="ok")
+
+        with make_client(handler) as client:
+            page = fetch_page(settings, "http://a.test/", client=client)
+        assert counts == {"a.test": 1, "b.test": 1}
+        assert seen == [PUBLIC_IP, "93.184.216.35"]
+        assert page.text == "ok" and page.url == "http://b.test/admin"
+
+    def test_ipv6_literal_pinned_with_brackets(self, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+        rebinding_dns(monkeypatch, {"v6.test": ["2606:2800:220:1:248:1893:25c8:1946"]})
+        seen: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((str(request.url), request.headers["host"]))
+            return httpx.Response(200, headers={"content-type": "text/plain"}, text="v6")
+
+        with make_client(handler) as client:
+            assert fetch_page(settings, "https://v6.test:8443/p", client=client).text == "v6"
+        assert seen == [("https://[2606:2800:220:1:248:1893:25c8:1946]:8443/p", "v6.test:8443")]
+
+    def test_next_address_tried_on_connect_error(self, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+        def multi(host: str, port: Any, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)) for ip in (PUBLIC_IP, "93.184.216.35")]
+
+        monkeypatch.setattr(socket, "getaddrinfo", multi)
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.host)
+            if request.url.host == PUBLIC_IP:
+                raise httpx.ConnectError("injoignable", request=request)
+            return httpx.Response(200, headers={"content-type": "text/plain"}, text="second")
+
+        with make_client(handler) as client:
+            assert fetch_page(settings, "http://multi.test/", client=client).text == "second"
+        assert seen == [PUBLIC_IP, "93.184.216.35"]
+        with make_client(lambda r: (_ for _ in ()).throw(httpx.ConnectError("x", request=r))) as client:
+            with pytest.raises(ToolError, match="récupération impossible : ConnectError"):
+                fetch_page(settings, "http://multi.test/", client=client)
+
+
+# ------------------------------------------------ décompression bornée
+def encoded_response(body: bytes, encoding: str) -> httpx.Response:
+    """Réponse dont le corps compressé arrive **brut** (``stream=``), comme sur
+    le réseau — ``content=`` serait décodé par httpx dès la construction."""
+    return httpx.Response(200, headers={"content-type": "text/plain", "content-encoding": encoding},
+                          stream=httpx.ByteStream(body))
+
+
+class TestBoundedBody:
+    """Régression : ``iter_bytes`` décompressait chaque fragment réseau en
+    entier avant la comparaison au plafond (58 Ko gzip ⇒ pic de 142 Mo)."""
+
+    def test_accept_encoding_limited_to_gzip_deflate(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["ae"] = request.headers.get("accept-encoding", "")
+            return httpx.Response(200, headers={"content-type": "text/plain"}, text="ok")
+
+        with make_client(handler) as client:
+            fetch_page(settings, "https://www.example.com/", client=client)
+        assert seen["ae"] == "gzip, deflate"
+
+    @pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+    def test_decompressed_output_capped(self, settings: Settings, public_dns: Callable[[str], None],
+                                        monkeypatch: pytest.MonkeyPatch, encoding: str) -> None:
+        monkeypatch.setattr(web, "MAX_FETCH_BYTES", 1000)
+        raw = b"z" * 100_000
+        body = gzip.compress(raw) if encoding == "gzip" else zlib.compress(raw)
+        handler = lambda r: encoded_response(body, encoding)  # noqa: E731
+        with make_client(handler) as client:
+            with client.stream("GET", "https://x.example/") as response:
+                data, truncated = web._read_body(response, 1000)
+            page = fetch_page(settings, "https://www.example.com/", max_chars=10_000, client=client)
+        assert data == b"z" * 1000 and truncated is True
+        assert page.text.startswith("z" * 1000) and "z" * 1001 not in page.text
+        assert "lecture arrêtée à 1000 octets" in page.text
+
+    def test_raw_deflate_accepted(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        body = compressor.compress(b"brut") + compressor.flush()
+        with make_client(lambda r: encoded_response(body, "deflate")) as client:
+            assert fetch_page(settings, "https://www.example.com/", client=client).text == "brut"
+
+    def test_exact_compressed_size_not_flagged(self, settings: Settings, public_dns: Callable[[str], None],
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(web, "MAX_FETCH_BYTES", 500)
+        body = gzip.compress(b"q" * 500)
+        with make_client(lambda r: encoded_response(body, "gzip")) as client:
+            page = fetch_page(settings, "https://www.example.com/", client=client)
+        assert page.text == "q" * 500
+
+    def test_peak_memory_bounded(self, settings: Settings, public_dns: Callable[[str], None],
+                                 monkeypatch: pytest.MonkeyPatch) -> None:
+        limit = 1_000_000
+        monkeypatch.setattr(web, "MAX_FETCH_BYTES", limit)
+        body = gzip.compress(b"\0" * 40_000_000, compresslevel=6)  # ≈ 40 Ko sur le fil
+        assert len(body) < 100_000
+        handler = lambda r: encoded_response(body, "gzip")  # noqa: E731
+        with make_client(handler) as client:
+            tracemalloc.start()
+            try:
+                with client.stream("GET", "https://x.example/") as response:
+                    data, truncated = web._read_body(response, limit)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        assert len(data) == limit and truncated is True
+        # ≈ 3 × limit après correction (tampon, tranche décodée, copie) ; ≈ 40 × avant.
+        assert peak < 5 * limit, f"pic mémoire {peak / 1e6:.1f} Mo pour un plafond de {limit / 1e6:.1f} Mo"
+
+    def test_unsupported_encoding_refused(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        with make_client(lambda r: encoded_response(b"\x0b\x00\x80", "br")) as client:
+            with pytest.raises(ToolError, match="encodage de contenu non pris en charge : br"):
+                fetch_page(settings, "https://www.example.com/", client=client)
+
+    def test_corrupt_gzip_is_tool_error(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        with make_client(lambda r: encoded_response(b"pas du gzip", "gzip")) as client:
+            with pytest.raises(ToolError, match="contenu gzip corrompu"):
+                fetch_page(settings, "https://www.example.com/", client=client)
+
+
+# ------------------------------------------------------ échéance globale
+class SlowStream(httpx.SyncByteStream):
+    """Flux qui cède un octet toutes les ``interval`` secondes, ``n`` fois."""
+
+    def __init__(self, n: int, interval: float) -> None:
+        self.n, self.interval = n, interval
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self.n):
+            time.sleep(self.interval)
+            yield b"x"
+
+
+class TestGlobalDeadline:
+    """Régression : ``web.timeout`` ne bornait que chaque opération httpx ; un
+    serveur au goutte-à-goutte occupait fetch_url indéfiniment."""
+
+    def test_slow_trickle_aborted(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        settings.web.timeout = 0.3  # budget global = 0.9 s
+        handler = lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, stream=SlowStream(50, 0.1))  # noqa: E731
+        t0 = time.monotonic()
+        with make_client(handler) as client:
+            with pytest.raises(ToolError, match="délai global dépassé \\(0.9s\\)"):
+                fetch_page(settings, "https://slow.example/", client=client)
+        assert time.monotonic() - t0 < 2.5
+
+    def test_short_trickle_succeeds(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        settings.web.timeout = 0.3
+        handler = lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, stream=SlowStream(4, 0.05))  # noqa: E731
+        with make_client(handler) as client:
+            assert fetch_page(settings, "https://slow.example/", client=client).text == "xxxx"
+
+    def test_slow_redirect_chain_aborted(self, settings: Settings, public_dns: Callable[[str], None]) -> None:
+        settings.web.timeout = 0.2  # budget global = 0.6 s
+        hops: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            hops.append(request.extensions["timeout"]["read"])
+            time.sleep(0.25)
+            return httpx.Response(302, headers={"location": "/again"})
+
+        t0 = time.monotonic()
+        with make_client(handler) as client:
+            with pytest.raises(ToolError, match="délai global dépassé"):
+                fetch_page(settings, "https://slow.example/", client=client)
+        assert time.monotonic() - t0 < 2.0
+        # le délai de chaque opération est aussi rogné par le budget restant
+        assert len(hops) <= 3 and hops[0] == 0.2 and all(h <= 0.2 for h in hops)
+
+
 class TestUrlGuard:
     @pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://example.com/x", "example.com", "javascript:alert(1)", "", "   "])
     def test_bad_scheme(self, settings: Settings, url: str) -> None:
@@ -443,6 +686,14 @@ class TestUrlGuard:
             "http://[::1]/",
             "http://[::ffff:10.0.0.1]/",
             "http://[fe80::1]/",
+            # CGNAT / RFC 6598 (Tailscale…) et autres plages non globales
+            "http://100.64.0.1/",
+            "http://100.100.100.100/",
+            "http://100.127.255.254/",
+            "http://[::ffff:100.64.0.1]/",
+            "http://192.0.0.8/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
         ],
     )
     def test_internal_literal_refused(self, settings: Settings, url: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,7 +704,8 @@ class TestUrlGuard:
         with pytest.raises(ToolError, match="adresse interne refusée"):
             fetch_page(settings, url, client=make_client(lambda r: httpx.Response(200, text="x")))
 
-    @pytest.mark.parametrize("ip", ["127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.0.10", "169.254.1.1", "0.0.0.0", "::1", "fd00::1"])
+    @pytest.mark.parametrize("ip", ["127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.0.10", "169.254.1.1", "0.0.0.0", "::1", "fd00::1",
+                                    "100.100.100.100"])
     def test_hostname_resolving_to_internal_refused(self, settings: Settings, public_dns: Callable[[str], None], ip: str) -> None:
         public_dns(ip)
         called = False
@@ -477,6 +729,12 @@ class TestUrlGuard:
 
     def test_public_hostname_allowed(self, public_dns: Callable[[str], None]) -> None:
         assert web.check_url(" https://www.example.com/a?b=1 ") == "https://www.example.com/a?b=1"
+
+    @pytest.mark.parametrize("url", ["http://100.63.255.255/", "http://100.128.0.1/", "http://93.184.216.34/",
+                                     "http://[2606:2800:220:1:248:1893:25c8:1946]/"])
+    def test_cgnat_bounds_still_allowed(self, url: str) -> None:
+        """Les voisines de 100.64.0.0/10 restent globales : pas de sur-blocage."""
+        assert web.check_url(url) == url
 
 
 # ---------------------------------------------------------------- outils

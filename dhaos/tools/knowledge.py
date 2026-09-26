@@ -2,11 +2,17 @@
 
 Ils s'appuient sur ``ctx.kb`` (``dhaos.kb.manager.KnowledgeManager``) et sont
 programmés contre son contrat : ``list_bases()``, ``get_base(name)``,
-``create_base(name)``, ``add_text(base, text, title=...)``, ``search(query,
-bases=..., top_k=...)``. Les erreurs métier (``KnowledgeError``) sont
-renvoyées au modèle comme résultats en erreur, jamais propagées. Sans
-gestionnaire (``ctx.kb is None``), les outils répondent « bases de savoir
-indisponibles ».
+``create_base(name)``, ``add_note(base, text, title=...)`` (→ ``NoteResult``,
+repli sur ``add_text`` → ``int`` si absent), ``search(query, bases=...,
+top_k=...)``. Les erreurs métier (``KnowledgeError``) sont renvoyées au
+modèle comme résultats en erreur, jamais propagées. Sans gestionnaire
+(``ctx.kb is None``), les outils répondent « bases de savoir indisponibles ».
+
+``kb_add_note`` signale explicitement le **remplacement** d'une note
+existante de même titre (message « note remplacée », ``data["replaced"]``) et
+journalise chaque ajout (``ctx.journal``, genre ``kb_note``) : les titres
+viennent du modèle et un titre réutilisé écraserait sinon silencieusement du
+savoir accumulé.
 """
 from __future__ import annotations
 
@@ -174,14 +180,28 @@ class KBAddNoteTool(Tool):
             if kb.get_base(base) is None:
                 kb.create_base(base)
                 created = True
-            doc_id = kb.add_text(base, text, title=title or None)
+            doc_id, replaced = _add_note(kb, base, text, title or None)
         except KnowledgeError as e:
             raise ToolError(str(e)) from e
+        journal = getattr(ctx, "journal", None)
+        if journal is not None:
+            journal.record("kb_note", base=base, doc_id=doc_id, title=title, replaced=replaced, created=created)
         suffix = " (base créée)" if created else ""
+        verb = "remplacée dans" if replaced else "ajoutée à"
         return ToolResult(
-            f"note ajoutée à {base} (doc {doc_id}){suffix}",
-            data={"base": base, "doc_id": doc_id, "created": created, "title": title},
+            f"note {verb} {base} (doc {doc_id}){suffix}",
+            data={"base": base, "doc_id": doc_id, "created": created, "title": title, "replaced": replaced},
         )
+
+
+def _add_note(kb: Any, base: str, text: str, title: str | None) -> tuple[int, bool]:
+    """Ajoute la note via ``add_note`` (→ ``(doc_id, remplacée)``) ; un
+    gestionnaire minimal n'exposant que ``add_text`` renvoie ``(doc_id, False)``."""
+    add_note = getattr(kb, "add_note", None)
+    if add_note is None:
+        return int(kb.add_text(base, text, title=title)), False
+    result = add_note(base, text, title=title)
+    return int(getattr(result, "doc_id")), bool(getattr(result, "replaced", False))
 
 
 def tools(settings: Settings) -> list[Tool]:

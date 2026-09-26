@@ -275,10 +275,15 @@ def test_add_text_notes(kb: KnowledgeManager) -> None:
     # même titre ⇒ remplacement
     kb.add_text("dev", "Toujours typer les fonctions et les documenter.", title="Règle")
     assert len(kb.list_documents("dev")) == 1
-    # sans titre : titre = première ligne, source dérivée
+    # sans titre : titre = première ligne, source dérivée (première ligne + hash)
     kb.add_text("dev", "Première ligne\nseconde ligne")
     kb.add_text("dev", "Première ligne\nseconde ligne")  # identique ⇒ pas de doublon
     assert len(kb.list_documents("dev")) == 2
+    untitled = [d for d in kb.list_documents("dev") if d.title == "Première ligne"]
+    assert len(untitled) == 1 and untitled[0].source.startswith("note:Première ligne#")
+    # même première ligne, texte différent ⇒ nouvelle note (pas d'écrasement)
+    kb.add_text("dev", "Première ligne\ntroisième ligne")
+    assert len(kb.list_documents("dev")) == 3
     kb.add_text("dev", "Autre note", source="custom:1")
     assert any(d.source == "custom:1" for d in kb.list_documents("dev"))
     with pytest.raises(KnowledgeError):
@@ -287,6 +292,27 @@ def test_add_text_notes(kb: KnowledgeManager) -> None:
         kb.add_text("absent", "x")
     assert kb.remove_document("dev", "custom:1")
     assert not kb.remove_document("dev", "custom:1")
+
+
+def test_add_note_reports_replacement(kb: KnowledgeManager) -> None:
+    """Régression : ``add_text`` ne disait pas qu'une note de même titre avait
+    été remplacée ; ``add_note`` renvoie ``NoteResult.replaced``."""
+    kb.create_base("dev")
+    first = kb.add_note("dev", "Toujours typer.", title="Règle")
+    assert (first.doc_id, first.source, first.title, first.replaced) == (1, "note:Règle", "Règle", False)
+    same = kb.add_note("dev", "Toujours typer.", title="Règle")
+    assert same.doc_id == 1 and same.replaced is False  # inchangé ⇒ pas un remplacement
+    changed = kb.add_note("dev", "Toujours typer et documenter.", title="Règle")
+    assert changed.doc_id == 1 and changed.replaced is True
+    assert kb.add_text("dev", "Encore autre chose.", title="Règle") == 1
+    assert len(kb.list_documents("dev")) == 1
+    # sans titre : source dérivée et jamais de remplacement entre textes différents
+    a = kb.add_note("dev", "TODO\nfaire A")
+    b = kb.add_note("dev", "TODO\nfaire B")
+    assert a.doc_id != b.doc_id and a.source != b.source and not a.replaced and not b.replaced
+    assert a.title == b.title == "TODO"
+    with pytest.raises(KnowledgeError):
+        kb.add_note("dev", " ")
 
 
 def test_remove_document_by_path(kb: KnowledgeManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -502,3 +528,71 @@ def test_document_kind_and_extract(tmp_path: Path, settings: Settings) -> None:
     assert extract(empty, settings) is None
     with pytest.raises(OSError):
         extract(tmp_path / "absent.txt", settings)
+
+
+# ------------------------------------------------- régressions : reindex atomique
+class _FlakyEmbedder:
+    """Embedder ``hash:<dim>`` qui échoue au ``fail_at``-ième appel de ``embed``."""
+
+    name = "hash"
+
+    def __init__(self, dim: int, fail_at: int = 2) -> None:
+        self.dim = dim
+        self.calls = 0
+        self.fail_at = fail_at
+        self._inner = HashEmbedder(dim=dim)
+
+    def embed(self, texts):  # noqa: ANN001, ANN201
+        self.calls += 1
+        if self.calls >= self.fail_at:
+            raise RuntimeError("Ollama a coupé")
+        return self._inner.embed(texts)
+
+
+def _chunk_dims(kb: KnowledgeManager, base: str) -> set[int]:
+    base_id = int(kb.store.get_base(base)["id"])
+    rows = kb.store.conn.execute(
+        "SELECT c.dim FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE d.base_id = ?", (base_id,)
+    ).fetchall()
+    return {int(r["dim"]) for r in rows}
+
+
+def test_reindex_failure_leaves_base_untouched(settings: Settings) -> None:
+    kb = KnowledgeManager(settings, embedder=HashEmbedder(dim=64))
+    kb.create_base("notes")
+    kb.add_text("notes", "alpha bravo charlie delta", title="n1")
+    kb.add_text("notes", "echo foxtrot golf hotel", title="n2")
+    assert _chunk_dims(kb, "notes") == {64}
+    kb.close()
+
+    flaky = _FlakyEmbedder(dim=128, fail_at=2)
+    other = KnowledgeManager(settings, embedder=flaky)
+    with pytest.raises(KnowledgeError):
+        other.reindex("notes")
+    assert flaky.calls == 2
+    # Rien n'a été écrit : dimensions homogènes, étiquette inchangée.
+    assert _chunk_dims(other, "notes") == {64}
+    assert other.get_base("notes").embedder == "hash:64"
+    other.close()
+
+    back = KnowledgeManager(settings, embedder=HashEmbedder(dim=64))
+    assert [h.title for h in back.search("alpha bravo", mode="vector")][:1] == ["n1"]
+    assert [h.title for h in back.search("echo foxtrot", mode="vector")][:1] == ["n2"]
+    back.close()
+
+
+def test_reindex_success_rewrites_all_chunks(settings: Settings) -> None:
+    kb = KnowledgeManager(settings, embedder=HashEmbedder(dim=64))
+    kb.create_base("notes")
+    kb.add_text("notes", "alpha bravo charlie delta", title="n1")
+    kb.add_text("notes", "echo foxtrot golf hotel", title="n2")
+    kb.close()
+
+    other = KnowledgeManager(settings, embedder=HashEmbedder(dim=128))
+    n = other.reindex("notes")
+    assert n == other.get_base("notes").n_chunks == 2
+    assert _chunk_dims(other, "notes") == {128}
+    assert other.get_base("notes").embedder == "hash:128"
+    assert [h.title for h in other.search("alpha bravo", mode="vector")][:1] == ["n1"]
+    assert [h.title for h in other.search("echo foxtrot", mode="vector")][:1] == ["n2"]
+    other.close()

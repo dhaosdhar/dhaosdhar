@@ -331,6 +331,7 @@ class ReadFileTool(_FSTool):
             "end_line": {"type": "integer", "minimum": 1, "description": "Dernière ligne à renvoyer (incluse)."},
         },
         "required": ["path"],
+        "additionalProperties": False,
     }
 
     def _run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -373,6 +374,7 @@ class ListDirTool(_FSTool):
             "show_hidden": {"type": "boolean", "description": "Afficher aussi les entrées cachées et ignorées."},
         },
         "required": ["path"],
+        "additionalProperties": False,
     }
 
     def _run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -463,6 +465,7 @@ class FindFilesTool(_FSTool):
             "max_results": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Nombre max de résultats (défaut 200)."},
         },
         "required": ["pattern"],
+        "additionalProperties": False,
     }
 
     def _run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -513,6 +516,7 @@ class GrepTool(_FSTool):
             "max_results": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Nombre max de lignes (défaut 200)."},
         },
         "required": ["pattern"],
+        "additionalProperties": False,
     }
 
     def _run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -600,6 +604,7 @@ class WriteFileTool(_FSTool):
             "create_dirs": {"type": "boolean", "description": "Créer les dossiers parents manquants (défaut true)."},
         },
         "required": ["path", "content"],
+        "additionalProperties": False,
     }
     may_require_confirmation = True
 
@@ -640,6 +645,7 @@ class EditFileTool(_FSTool):
             "replace_all": {"type": "boolean", "description": "Remplacer toutes les occurrences (défaut false)."},
         },
         "required": ["path", "old_string", "new_string"],
+        "additionalProperties": False,
     }
     may_require_confirmation = True
 
