@@ -1,0 +1,38 @@
+# Unité systemd (utilisateur ou système) pour l'API HTTP de dhaos.
+#
+# Installation « utilisateur » (recommandée : les données restent dans ~/.local/share/dhaos) :
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/dhaos-api.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dhaos-api
+#   journalctl --user -u dhaos-api -f
+#
+# Adaptez ExecStart au chemin de votre environnement virtuel et, pour un usage
+# réseau, définissez api.token dans ~/.config/dhaos/config.toml et api.host.
+# Pour que le service démarre sans session ouverte : loginctl enable-linger $USER
+
+[Unit]
+Description=dhaos — API HTTP de l'assistant de codage (bases de savoir locales)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/dhaosdhar/.venv/bin/dhaos serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Décommentez pour surcharger la configuration sans toucher au fichier :
+# Environment=DHAOS__BACKENDS__DEFAULT=ollama
+# Environment=DHAOS__API__HOST=127.0.0.1
+# Environment=DHAOS__API__PORT=8642
+# Clé Anthropic si le backend Claude est utilisé (préférez un fichier EnvironmentFile en 0600) :
+# EnvironmentFile=%h/.config/dhaos/env
+
+# Durcissement (unité utilisateur : ces directives sont largement acceptées)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

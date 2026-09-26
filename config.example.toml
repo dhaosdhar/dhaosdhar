@@ -1,0 +1,201 @@
+# Configuration de dhaos — copiez ce fichier vers ~/.config/dhaos/config.toml
+# (ou lancez `dhaos config init`). Toute clé peut aussi être surchargée par
+# l'environnement : DHAOS__SECTION__CLE=valeur (ex. DHAOS__BACKENDS__DEFAULT=claude).
+#
+# backends.default   : "ollama" (local) ou "claude" (API Anthropic, clé via ANTHROPIC_API_KEY)
+# tools.read_roots   : racines lisibles par l'agent (tout le disque par défaut)
+# tools.deny_patterns: fichiers jamais lus ni écrits (secrets, trousseaux)
+# tools.write_policy : project | ask | all | deny  (project = libre dans le projet, confirmé ailleurs)
+# tools.shell_policy : ask | auto | deny           (ask = confirmé sauf liste blanche shell_auto_allow)
+# web.provider       : duckduckgo (sans clé) | searxng (searxng_url) | brave (brave_api_key)
+# kb.embedder        : auto | ollama | sentence-transformers | hash
+# api.token          : jeton Bearer exigé par l'API HTTP si défini
+
+[paths]
+# data_dir = "~/.local/share/dhaos"   # défaut XDG ; surcharge : DHAOS_DATA_DIR
+
+[backends]
+default = "ollama"
+
+[backends.ollama]
+host = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:7b"
+embed_model = "nomic-embed-text"
+timeout = 300.0
+num_ctx = 16384
+
+[backends.claude]
+model = "claude-opus-5"
+max_tokens = 64000
+effort = "xhigh"
+thinking_display = "omitted"
+fallbacks = true
+timeout = 600.0
+
+[tools]
+read_roots = [
+    "/",
+]
+deny_patterns = [
+    "~/.ssh/**",
+    "~/.gnupg/**",
+    "~/.aws/**",
+    "~/.config/gcloud/**",
+    "~/.kube/**",
+    "~/.docker/config.json",
+    "~/.netrc",
+    "~/.local/share/keyrings/**",
+    "~/.mozilla/**/logins.json",
+    "~/.mozilla/**/key4.db",
+    "~/.config/**/Login Data",
+    "~/.anthropic/**",
+    "~/.config/anthropic/**",
+    "~/.config/dhaos/**",
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/**",
+    "/proc/**",
+    "/sys/**",
+    "/dev/**",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.kdbx",
+    "*.keychain",
+    "*.keychain-db",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "id_ecdsa",
+    "credentials.json",
+    "service-account*.json",
+]
+write_policy = "project"
+shell_policy = "ask"
+shell_auto_allow = [
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "stat",
+    "file",
+    "which",
+    "pwd",
+    "echo",
+    "tree",
+    "du",
+    "df",
+    "find",
+    "grep",
+    "rg",
+    "diff",
+    "sort",
+    "uniq",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git remote -v",
+    "git ls-files",
+    "git blame",
+    "python --version",
+    "python3 --version",
+    "pip list",
+    "pip show",
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "node --version",
+    "npm ls",
+    "cargo --version",
+    "go version",
+    "make -n",
+    "uname",
+    "id",
+    "date",
+    "env | grep",
+    "printenv",
+]
+command_timeout = 120.0
+max_output_chars = 40000
+max_file_chars = 200000
+backup_before_write = true
+
+[web]
+provider = "duckduckgo"
+max_results = 8
+fetch_max_chars = 40000
+timeout = 20.0
+user_agent = "Mozilla/5.0 (X11; Linux x86_64) dhaos/0.1"
+
+[kb]
+embedder = "auto"
+st_model = "sentence-transformers/all-MiniLM-L6-v2"
+hash_dim = 512
+chunk_chars = 2400
+chunk_overlap = 300
+top_k = 8
+max_file_bytes = 5000000
+ignore_patterns = [
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "*.min.js",
+    "*.map",
+    "*.lock",
+    "package-lock.json",
+    "*.pyc",
+    "*.so",
+    "*.o",
+    "*.class",
+]
+
+[agent]
+max_iterations = 40
+collect_traces = true
+auto_kb_search = true
+extra_system_prompt = ""
+language = "fr"
+
+[api]
+host = "127.0.0.1"
+port = 8642
+auto_confirm = false
+
+[train.nano]
+n_layer = 4
+n_head = 4
+n_embd = 128
+block_size = 256
+batch_size = 16
+learning_rate = 0.0003
+steps = 500
+tokenizer = "bpe"
+bpe_vocab_size = 2048
+dropout = 0.0
+
+[train.finetune]
+base_model = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+lora_r = 16
+lora_alpha = 32
+lora_dropout = 0.05
+epochs = 1.0
+learning_rate = 0.0002
+max_seq_len = 2048
+batch_size = 2
+gradient_accumulation = 8
+load_in_4bit = true
