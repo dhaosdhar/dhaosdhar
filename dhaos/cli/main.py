@@ -177,19 +177,39 @@ def _print_usage(result: Any) -> None:
 
 
 def _run_turn(runtime: Any, text: str, *, stream: bool = True) -> Any:
-    """Un tour d'agent avec affichage en flux ; renvoie l'AgentResult."""
+    """Un tour d'agent avec affichage en flux ; renvoie l'AgentResult.
+
+    Tant que rien ne s'affiche (lecture du contexte, génération d'un appel
+    d'outil, exécution), un indicateur d'activité tourne sur stderr avec la
+    phase et le temps écoulé : l'utilisateur sait que ça travaille."""
     printer = ui.StreamPrinter()
+    activity = ui.Activity(enabled=False if not stream else None)
+
+    def on_text(chunk: str) -> None:
+        activity.stop()
+        printer(chunk)
 
     def tool_call(call: ToolCall) -> None:
+        activity.stop()
         printer.ensure_newline()
         _on_tool_call(call)
+        activity.start(f"exécution de {call.name}…")
 
-    result = runtime.agent.run(
-        text,
-        on_text=printer if stream else None,
-        on_tool_call=tool_call if stream else None,
-        on_tool_result=_on_tool_result if stream else None,
-    )
+    def tool_result(call: ToolCall, result: Any) -> None:
+        activity.stop()
+        _on_tool_result(call, result)
+        activity.start("le modèle poursuit…")
+
+    activity.start("le modèle lit le contexte et génère…")
+    try:
+        result = runtime.agent.run(
+            text,
+            on_text=on_text if stream else None,
+            on_tool_call=tool_call if stream else None,
+            on_tool_result=tool_result if stream else None,
+        )
+    finally:
+        activity.stop()
     if stream:
         printer.ensure_newline()
     return result

@@ -637,9 +637,7 @@ def format_search_results(results: list[SearchResult], query: str) -> str:
 class WebSearchTool(Tool):
     name = "web_search"
     description = (
-        "Recherche sur le web (DuckDuckGo, SearXNG ou Brave selon la configuration) "
-        "et renvoie une liste numérotée de résultats : titre, URL et extrait. "
-        "Utilisez ensuite fetch_url pour lire une page en entier."
+        'Recherche sur le web ; renvoie titres, URLs et extraits. Utilisez fetch_url pour lire une page en entier.'
     )
     parameters = {
         "type": "object",
@@ -669,9 +667,7 @@ class WebSearchTool(Tool):
 class FetchUrlTool(Tool):
     name = "fetch_url"
     description = (
-        "Télécharge une page web (http/https uniquement, jamais d'adresse interne) "
-        "et renvoie son texte : HTML nettoyé, texte brut, JSON, Markdown ou PDF. "
-        "La sortie est tronquée à max_chars caractères."
+        'Télécharge une page web (http/https) et renvoie son texte (HTML nettoyé, texte, JSON, Markdown ou PDF), tronqué à max_chars.'
     )
     parameters = {
         "type": "object",

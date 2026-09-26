@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from typing import Any, Iterable
 
 import typer
@@ -119,6 +121,57 @@ class StreamPrinter:
             sys.stdout.write("\n")
             sys.stdout.flush()
             self.at_line_start = True
+
+
+
+class Activity:
+    """Indicateur d'activité sur stderr pendant que rien ne s'affiche : spinner,
+    phase en cours et temps écoulé (« ⠋ le modèle lit le contexte… 37 s »).
+    Inactif quand stderr n'est pas un terminal (tube, service, tests)."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, stream: Any = None, enabled: bool | None = None) -> None:
+        self.stream = stream or sys.stderr
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)()) if enabled is None else enabled
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._label = ""
+        self._t0 = 0.0
+
+    def start(self, label: str) -> None:
+        if not self.enabled:
+            return
+        self.stop()
+        self._label = label
+        self._t0 = time.monotonic()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, name="dhaos-activity", daemon=True)
+        self._thread.start()
+
+    def _spin(self) -> None:
+        i = 0
+        while not self._stop.wait(0.2):
+            elapsed = int(time.monotonic() - self._t0)
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            self.stream.write(f"\r\x1b[2K{frame} {self._label} {elapsed} s")
+            self.stream.flush()
+            i += 1
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1)
+        self._thread = None
+        self.stream.write("\r\x1b[2K")
+        self.stream.flush()
+
+    def __enter__(self) -> "Activity":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
 
 
 # ----------------------------------------------------------------- tableaux

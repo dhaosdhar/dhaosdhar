@@ -317,11 +317,7 @@ class _FSTool(Tool):
 class ReadFileTool(_FSTool):
     name = "read_file"
     description = (
-        "Lit un fichier texte et renvoie son contenu avec les numéros de ligne "
-        "(format « N| texte »). Utilisez start_line / end_line (1-based, inclus) "
-        "pour ne lire qu'une partie d'un gros fichier. Chemin relatif = relatif au "
-        "projet. Les fichiers binaires et les fichiers protégés (secrets, clés) "
-        "sont refusés ; la sortie est tronquée au-delà de tools.max_file_chars."
+        "Lit un fichier texte (lignes numérotées « N| texte »). start_line/end_line pour n'en lire qu'une partie. Binaires et fichiers protégés refusés."
     )
     parameters = {
         "type": "object",
@@ -359,12 +355,7 @@ class ReadFileTool(_FSTool):
 class ListDirTool(_FSTool):
     name = "list_dir"
     description = (
-        "Liste le contenu d'un répertoire sous forme d'arborescence indentée : "
-        "type (d = dossier, f = fichier, l = lien symbolique), nom et taille. "
-        "depth (1 à 3) contrôle la profondeur. Par défaut les entrées cachées "
-        "(nom commençant par un point) et les dossiers techniques (.git, "
-        "node_modules, __pycache__, .venv…) sont masqués : show_hidden=true pour "
-        "tout afficher. Limité à 500 entrées."
+        'Liste un répertoire en arborescence (d/f/l, nom, taille), depth de 1 à 3. Entrées cachées et dossiers techniques masqués sauf show_hidden.'
     )
     parameters = {
         "type": "object",
@@ -451,11 +442,7 @@ class ListDirTool(_FSTool):
 class FindFilesTool(_FSTool):
     name = "find_files"
     description = (
-        "Recherche des fichiers par motif glob (ex. « *.py », « src/**/*.ts », "
-        "« test_*.py ») sous un répertoire (root, par défaut le projet). Le motif "
-        "est comparé au chemin relatif et au nom du fichier. Les dossiers "
-        "techniques (.git, node_modules, .venv…) sont ignorés, les liens "
-        "symboliques ne sont pas suivis. Résultats triés, limités à max_results."
+        'Cherche des fichiers par motif glob (ex. « *.py », « src/**/*.ts ») sous root (défaut : projet). Dossiers techniques ignorés.'
     )
     parameters = {
         "type": "object",
@@ -500,11 +487,7 @@ class FindFilesTool(_FSTool):
 class GrepTool(_FSTool):
     name = "grep"
     description = (
-        "Recherche une expression régulière (syntaxe Python) dans les fichiers "
-        "texte d'un répertoire (root, par défaut le projet ; peut aussi être un "
-        "fichier). glob restreint les fichiers examinés (ex. « *.py »). Renvoie "
-        "des lignes « chemin:numéro: texte » (texte tronqué à 300 caractères). "
-        "Binaires, fichiers trop gros et fichiers protégés sont ignorés."
+        'Cherche une expression régulière (Python) dans les fichiers texte sous root (défaut : projet) ; glob filtre les noms. Renvoie « chemin:ligne: texte ».'
     )
     parameters = {
         "type": "object",
@@ -589,12 +572,7 @@ class GrepTool(_FSTool):
 class WriteFileTool(_FSTool):
     name = "write_file"
     description = (
-        "Écrit un fichier texte (UTF-8) en remplaçant intégralement son contenu, "
-        "ou le crée (create_dirs crée les dossiers parents). Pour modifier une "
-        "partie d'un fichier existant, préférez edit_file. Écriture libre dans le "
-        "projet, confirmée par l'utilisateur ailleurs (selon la politique) ; "
-        "l'ancien contenu est sauvegardé et l'action journalisée. Fichiers "
-        "protégés (secrets, clés) refusés."
+        'Crée un fichier ou remplace tout son contenu (UTF-8). Pour modifier une partie, préférez edit_file. Hors projet : confirmation ; sauvegarde et journal.'
     )
     parameters = {
         "type": "object",
@@ -630,11 +608,7 @@ class WriteFileTool(_FSTool):
 class EditFileTool(_FSTool):
     name = "edit_file"
     description = (
-        "Remplace un passage exact d'un fichier texte : old_string doit apparaître "
-        "tel quel (indentation comprise) et une seule fois, sauf replace_all=true "
-        "qui remplace toutes les occurrences. Lisez le fichier avant pour copier "
-        "le passage exact. Même politique que write_file (confirmation hors "
-        "projet, sauvegarde, journal). Renvoie un extrait de diff."
+        "Remplace un passage exact d'un fichier : old_string doit être unique (sauf replace_all). Lisez le fichier avant pour copier le passage exact."
     )
     parameters = {
         "type": "object",

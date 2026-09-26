@@ -67,8 +67,7 @@ def format_hits(hits: list[Any]) -> str:
 class KBListTool(Tool):
     name = "kb_list"
     description = (
-        "Liste les bases de savoir locales (catégories de connaissances) avec "
-        "leur description et leur taille. Consultez-les avec kb_search."
+        'Liste les bases de savoir locales (nom, description, taille).'
     )
     parameters = {"type": "object", "properties": {}, "additionalProperties": False}
 
@@ -97,9 +96,7 @@ class KBListTool(Tool):
 class KBSearchTool(Tool):
     name = "kb_search"
     description = (
-        "Recherche (hybride : sémantique + mots-clés) dans les bases de savoir "
-        "locales. Sans `bases`, toutes les bases sont interrogées. Renvoie les "
-        "passages les plus pertinents avec leur base, leur source et un score."
+        'Recherche hybride dans les bases de savoir locales (toutes si bases absent) ; renvoie les passages pertinents avec base, source et score.'
     )
     parameters = {
         "type": "object",
@@ -153,8 +150,7 @@ class KBSearchTool(Tool):
 class KBAddNoteTool(Tool):
     name = "kb_add_note"
     description = (
-        "Ajoute une note textuelle à une base de savoir (créée si elle n'existe "
-        "pas) : conclusions, procédures, décisions à retenir pour plus tard."
+        'Ajoute une note à une base de savoir (créée si absente) : conclusions, procédures, décisions à retenir.'
     )
     parameters = {
         "type": "object",

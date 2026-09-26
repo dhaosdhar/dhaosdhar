@@ -81,13 +81,7 @@ def _section(text: str, limit: int) -> str:
 class RunCommandTool(Tool):
     name = "run_command"
     description = (
-        "Exécute une commande shell (bash -c) dans le projet ou dans cwd, et "
-        "renvoie le code de sortie, stdout et stderr (tronqués). Non interactive : "
-        "pas d'entrée standard. Délai maximal configurable (timeout en secondes, "
-        "plafonné par la configuration). Les commandes hors liste blanche "
-        "(ls, cat, git status, pytest…) demandent une confirmation à "
-        "l'utilisateur selon la politique ; pour lire ou modifier des fichiers, "
-        "préférez read_file / edit_file."
+        'Exécute une commande bash non interactive dans le projet (ou cwd) ; renvoie code de sortie, stdout et stderr. Hors liste blanche : confirmation.'
     )
     parameters = {
         "type": "object",
