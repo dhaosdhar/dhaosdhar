@@ -132,7 +132,7 @@ Autres garde-fous : les commandes reçoivent un environnement expurgé des varia
 contient `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` ou `CREDENTIAL`, des variables d'agent
 (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`) et de toute variable dont la valeur est une URL
 avec identifiants (`postgres://user:mdp@hôte/…`) ; `env` / `printenv` ne sont pas en liste blanche ; `fetch_url` refuse
-localhost et les réseaux privés, à chaque redirection ; l'agent s'arrête après `agent.max_iterations` tours (40).
+localhost et les réseaux privés, à chaque redirection ; l'agent s'arrête après `agent.max_iterations` tours (40). Risque résiduel assumé : `pytest` (et `python -m pytest`) figure en liste blanche alors qu'il exécute par construction le code du projet (`conftest.py`, plugins, `-p`) ; retirez-le de `shell_auto_allow` si le projet n'est pas de confiance.
 
 **Confirmations.** En CLI, une question oui/non apparaît (`Exécuter : make install ?`). Si l'entrée
 standard n'est pas interactive (tube, script, service), la confirmation est **refusée** et le modèle

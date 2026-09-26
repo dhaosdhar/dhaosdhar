@@ -428,3 +428,37 @@ def test_run_command_rejects_extra_args(registry: ToolRegistry, ctx: ToolContext
     assert r.is_error and "INVALID_JSON" in r.content and "Additional properties" in r.content
     assert ctx.journal.tail() == []
     assert shell.tools(ctx.settings)[0].parameters["additionalProperties"] is False
+
+
+def test_keyboard_interrupt_kills_process_group(ctx, monkeypatch):
+    """Ctrl-C pendant run_command : le groupe de processus est tué, le journal
+    note l'interruption et l'exception remonte (elle n'est pas avalée)."""
+    import subprocess as _sp
+
+    from dhaos.tools import shell as shell_mod
+    from dhaos.tools.base import ToolRegistry
+    from dhaos.types import ToolCall
+
+    killed: list[object] = []
+
+    class FakeProc:
+        returncode = None
+        pid = 4242
+
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            return "", ""
+
+    monkeypatch.setattr(shell_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(shell_mod, "_kill_process_group", lambda proc: killed.append(proc))
+    registry = ToolRegistry(shell_mod.tools(ctx.settings))
+    with pytest.raises(KeyboardInterrupt):
+        registry.execute(ToolCall(id="k1", name="run_command", arguments={"command": "sleep 30"}), ctx)
+    assert len(killed) == 1
+    entries = [e for e in ctx.journal.tail() if e["kind"] == "run_command"]
+    assert entries and entries[-1].get("interrupted") is True and entries[-1]["exit"] is None

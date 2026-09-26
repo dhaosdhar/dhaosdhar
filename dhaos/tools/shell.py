@@ -160,6 +160,19 @@ class RunCommandTool(Tool):
         half = max(1000, ctx.settings.tools.max_output_chars // 2)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
+        except (KeyboardInterrupt, SystemExit):
+            # Ctrl-C dans la CLI : le fils (groupe de processus séparé) ne
+            # reçoit pas le signal, on le tue avant de laisser remonter.
+            _kill_process_group(proc)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            ctx.journal.record(
+                "run_command", command=command, cwd=str(cwd), exit=None,
+                duration=round(time.monotonic() - started, 3), confirmed=confirmed, interrupted=True,
+            )
+            raise
         except subprocess.TimeoutExpired:
             _kill_process_group(proc)
             try:
