@@ -384,6 +384,25 @@ dhaos journal -n 50                 # écritures et commandes (voir garde-fous)
 `agent.collect_traces = false` marque les nouvelles sessions `traces: false` :
 conservées, mais exclues de `train dataset` et `train corpus`.
 
+## Performances sur CPU (sans GPU)
+
+Le temps de réponse dépend presque entièrement d'Ollama, pas de dhaos. Deux mesures suffisent :
+
+```sh
+ollama run qwen2.5-coder:7b --verbose "Dis bonjour"   # prompt eval rate / eval rate en tokens/s
+free -h                                                 # RAM disponible et swap utilisé
+```
+
+| Symptôme | Cause | Remède |
+|---|---|---|
+| `prompt eval rate` < 20 tok/s, swap utilisé, RAM « available » < taille du modèle (`ollama ps`) | le modèle est en partie en mémoire d'échange | fermer ce qui consomme (machines virtuelles, navigateurs), modèle plus petit (`qwen2.5-coder:3b`, 1,9 Go), `backends.ollama.num_ctx` à 8192 (KV cache divisé par deux) |
+| `prompt eval rate` 50–150 tok/s mais réponse longue | débit normal d'un 7B sur CPU (4–10 tok/s en génération) | modèle plus petit pour les tâches simples, Claude (`--backend claude`) pour les tâches lourdes, GPU |
+| 30–60 s avant le premier appel d'outil | lecture du prompt système et des schémas d'outils (~2 000 tokens) ; ensuite Ollama réutilise le cache du préfixe | normal ; `--no-tools` pour une question sans action |
+
+Ordre de grandeur mémoire : poids du modèle (7B Q4 ≈ 4,7 Go ; 3B ≈ 1,9 Go ; 1,5B ≈ 1 Go) + KV cache
+(≈ 0,9 Go pour 16 k de contexte sur un 7B) + le reste de la machine. `keep_alive = "30m"` évite de recharger
+le modèle (≈ 20 s) entre deux requêtes.
+
 ## Dépannage
 
 | Symptôme | Cause et remède |
