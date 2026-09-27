@@ -645,3 +645,16 @@ def test_gate_json_block_not_a_call_is_flushed(settings: Settings) -> None:
     shown: list[str] = []
     resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
     assert "".join(shown) == text and resp.text == text and resp.tool_calls == []
+
+
+def test_rescue_flattened_arguments_next_to_name() -> None:
+    """Arguments écrits à plat à côté du nom : récupérés si ce sont des paramètres connus."""
+    known = {"kb_search": {"query", "bases", "top_k"}, "list_dir": {"path", "depth"}}
+    rest, calls = rescue_text_tool_calls('{"name": "kb_search", "query": "politique d\'accès"}', known)
+    assert rest == "" and calls == [{"name": "kb_search", "arguments": {"query": "politique d'accès"}}]
+    # clé inconnue à plat : pas d'arguments devinés
+    rest, calls = rescue_text_tool_calls('{"name": "kb_search", "foo": 1}', known)
+    assert calls == [{"name": "kb_search", "arguments": {}}]
+    # avec un simple ensemble de noms, rien n'est deviné
+    rest, calls = rescue_text_tool_calls('{"name": "kb_search", "query": "x"}', {"kb_search"})
+    assert calls == [{"name": "kb_search", "arguments": {}}]

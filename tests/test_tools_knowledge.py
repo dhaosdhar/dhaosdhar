@@ -345,3 +345,13 @@ def test_kb_search_truncates_long_passages(kb_ctx: ToolContext, kb: FakeKB, regi
     kb.add_text("dev", long_text, title="long")
     result = registry.execute(tool_call("kb_search", query="mot"), kb_ctx)
     assert not result.is_error and "[…]" in result.content and len(result.content) < 300
+
+
+def test_validation_error_message_is_actionable(kb_ctx: ToolContext, registry: ToolRegistry) -> None:
+    """Un appel sans argument obligatoire reçoit un message qui nomme le paramètre
+    manquant, les paramètres attendus et invite à rappeler l'outil."""
+    r = registry.execute(tool_call("kb_search"), kb_ctx)
+    assert r.is_error and "INVALID_JSON" in r.content
+    assert "appel de kb_search invalide" in r.content and "'query' is a required property" in r.content
+    assert "query (string, obligatoire)" in r.content and "top_k (integer)" in r.content
+    assert "Rappelle kb_search" in r.content

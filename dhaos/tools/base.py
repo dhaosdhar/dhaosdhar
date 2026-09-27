@@ -64,6 +64,21 @@ class Tool(ABC):
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
 
 
+def describe_parameters(schema: dict[str, Any]) -> str:
+    """« query (string, obligatoire), bases (array), top_k (integer) » depuis un schéma JSON."""
+    props = (schema or {}).get("properties") or {}
+    required = set((schema or {}).get("required") or [])
+    if not props:
+        return "aucun"
+    parts = []
+    for name, spec in props.items():
+        kind = spec.get("type", "any") if isinstance(spec, dict) else "any"
+        if isinstance(kind, list):
+            kind = "/".join(str(k) for k in kind)
+        parts.append(f"{name} ({kind}, obligatoire)" if name in required else f"{name} ({kind})")
+    return ", ".join(parts)
+
+
 class ToolRegistry:
     def __init__(self, tools: list[Tool] | None = None):
         self._tools: dict[str, Tool] = {}
@@ -102,9 +117,13 @@ class ToolRegistry:
         try:
             jsonschema.validate(args, tool.parameters)
         except jsonschema.ValidationError as e:
+            # Message lisible par un petit modèle local : ce qui manque, ce qui
+            # est attendu, et l'invitation explicite à rappeler l'outil.
+            received = json.dumps(call.arguments, ensure_ascii=False)
             return ToolResult(
-                json.dumps({"INVALID_JSON": json.dumps(call.arguments, ensure_ascii=False), "error": e.message},
-                           ensure_ascii=False),
+                f"INVALID_JSON — appel de {call.name} invalide : {e.message}. "
+                f"Arguments reçus : {received}. Paramètres attendus : {describe_parameters(tool.parameters)}. "
+                f"Rappelle {call.name} avec des arguments corrects.",
                 is_error=True,
             )
         try:

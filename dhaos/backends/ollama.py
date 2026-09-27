@@ -98,8 +98,16 @@ def _iter_json_values(text: str):
         i = end
 
 
-def _call_from_object(obj: Any, tool_names: set[str]) -> dict[str, Any] | None:
-    """``{"name": outil, "arguments": {...}}`` (ou variantes) → appel normalisé."""
+_ARG_KEYS = ("arguments", "parameters", "input", "args")
+_META_KEYS = {"name", "function", "type", "id", "index"}
+
+
+def _call_from_object(obj: Any, tool_names: "set[str] | dict[str, set[str]]") -> dict[str, Any] | None:
+    """``{"name": outil, "arguments": {...}}`` (ou variantes) → appel normalisé.
+
+    ``tool_names`` peut associer à chaque outil ses noms de paramètres : un
+    petit modèle écrit parfois les arguments *à plat* à côté du nom
+    (``{"name": "kb_search", "query": "…"}``) ; ils sont alors récupérés."""
     if not isinstance(obj, dict):
         return None
     fn = obj["function"] if isinstance(obj.get("function"), dict) else obj
@@ -107,10 +115,15 @@ def _call_from_object(obj: Any, tool_names: set[str]) -> dict[str, Any] | None:
     if not isinstance(name, str) or name not in tool_names:
         return None
     args: Any = {}
-    for key in ("arguments", "parameters", "input", "args"):
+    for key in _ARG_KEYS:
         if key in fn:
             args = fn[key]
             break
+    else:
+        params = tool_names.get(name) if isinstance(tool_names, dict) else None
+        flat = {k: v for k, v in fn.items() if k not in _META_KEYS}
+        if params and flat and set(flat) <= set(params):
+            args = flat
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -135,7 +148,9 @@ def _calls_from_value(value: Any, tool_names: set[str]) -> list[dict[str, Any]]:
     return calls
 
 
-def rescue_text_tool_calls(text: str, tool_names: set[str]) -> tuple[str, list[dict[str, Any]]]:
+def rescue_text_tool_calls(
+    text: str, tool_names: "set[str] | dict[str, set[str]]"
+) -> tuple[str, list[dict[str, Any]]]:
     """Récupère les appels d'outils qu'un modèle a écrits *en texte* au lieu
     d'utiliser le mécanisme structuré : JSON nu ``{"name": …, "arguments": …}``,
     balises ``<tool_call>…</tool_call>`` ou bloc ```json. Seuls les noms
@@ -446,7 +461,8 @@ class OllamaBackend(Backend):
         if tools and not tool_calls:
             # Petits modèles locaux : l'appel d'outil arrive parfois en texte
             # (JSON nu, <tool_call>, bloc ```json) au lieu de message.tool_calls.
-            remainder, rescued = rescue_text_tool_calls(text, {t.name for t in tools})
+            known = {t.name: set((t.parameters or {}).get("properties", {}) or {}) for t in tools}
+            remainder, rescued = rescue_text_tool_calls(text, known)
             if rescued:
                 _debug(f"appel(s) d'outil récupéré(s) depuis le texte : {[c['name'] for c in rescued]}")
                 for call in rescued:

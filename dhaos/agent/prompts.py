@@ -105,7 +105,8 @@ def _knowledge_section(settings: Settings, bases: list[Any]) -> list[str]:
     lines.extend(_format_base(b) for b in bases)
     if settings.agent.auto_kb_search:
         lines.append(
-            "Avant de répondre sur un sujet couvert par une base, appelle kb_search sur les "
+            "Avant de répondre sur un sujet couvert par une base, appelle kb_search "
+            "(paramètre obligatoire : query, la question ; bases pour restreindre) sur les "
             "bases pertinentes. Mémorise un apprentissage utile avec kb_add_note."
         )
     else:
