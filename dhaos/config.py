@@ -195,7 +195,7 @@ class KBConfig(BaseModel):
         default_factory=lambda: [
             ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
             ".mypy_cache", ".pytest_cache", ".ruff_cache", "*.min.js", "*.map",
-            "*.lock", "package-lock.json", "*.pyc", "*.so", "*.o", "*.class",
+            "*.lock", "package-lock.json", "*.pyc", "*.so", "*.o", "*.class", "*.egg-info",
         ]
     )
 
