@@ -89,6 +89,43 @@ class ChatRequest(BaseModel):
     no_tools: bool = Field(False, description="true : l'agent répond sans outils.")
 
 
+class ConfirmAnswer(BaseModel):
+    """Réponse de l'utilisateur à une demande de confirmation émise en SSE."""
+
+    id: str = Field(min_length=1, max_length=64)
+    answer: bool
+
+
+# Clés de configuration modifiables depuis l'API (réglages courants, sans secret).
+CONFIG_PATCH_KEYS: tuple[str, ...] = (
+    "backends.default", "backends.ollama.model", "backends.ollama.host", "backends.ollama.embed_model",
+    "backends.ollama.num_ctx", "backends.ollama.keep_alive", "backends.ollama.timeout",
+    "backends.claude.model", "backends.claude.effort",
+    "tools.write_policy", "tools.shell_policy", "kb.embedder", "kb.tool_top_k", "kb.tool_snippet_chars",
+    "web.provider", "web.searxng_url", "agent.language", "agent.auto_kb_search", "agent.max_iterations",
+    "agent.collect_traces",
+)
+
+
+class ConfigPatch(BaseModel):
+    """Modification d'une clé de configuration (``section.cle``)."""
+
+    key: str = Field(min_length=1, max_length=80)
+    value: Any
+
+
+class ModelsOut(BaseModel):
+    backend: str
+    default: str = ""
+    ok: bool = False
+    detail: str = ""
+    models: list[str] = Field(default_factory=list)
+
+
+class ReindexOut(BaseModel):
+    chunks: int
+
+
 # ============================================================== réponses
 class _FromAttributes(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -201,6 +238,11 @@ class HealthOut(BaseModel):
 
 
 __all__ = [
+    "CONFIG_PATCH_KEYS",
+    "ConfigPatch",
+    "ConfirmAnswer",
+    "ModelsOut",
+    "ReindexOut",
     "BackendHealth",
     "BaseCreate",
     "BaseDetail",

@@ -932,8 +932,9 @@ def serve(
     ctx: typer.Context,
     host: str | None = typer.Option(None, "--host", help="Adresse d'écoute (défaut : api.host)."),
     port: int | None = typer.Option(None, "--port", min=1, max=65535, help="Port (défaut : api.port)."),
+    open_browser: bool = typer.Option(False, "--open", help="Ouvrir l'interface web dans le navigateur."),
 ) -> None:
-    """Lancer l'API HTTP (uvicorn)."""
+    """Lancer l'API HTTP et l'interface web (uvicorn)."""
     settings = _settings(ctx)
     host = host or settings.api.host
     port = port or settings.api.port
@@ -948,10 +949,21 @@ def serve(
     except (ImportError, AttributeError, NotImplementedError) as e:
         fail(f"API indisponible : {e}")
         return
-    note(f"dhaos API sur http://{host}:{port}")
     state = getattr(application, "state", None)
+    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    ui_url = f"http://{browse_host}:{port}/"
+    note(f"dhaos API sur http://{host}:{port}")
     if getattr(state, "token_generated", False):
         note(f"jeton d'accès (api.token absent) : {state.token}")
+        ui_url += f"?token={state.token}"
+        note(f"interface web : {ui_url}")
+    else:
+        note(f"interface web : {ui_url} (jeton : api.token)")
+    if open_browser:
+        import threading
+        import webbrowser
+
+        threading.Timer(1.0, webbrowser.open, [ui_url]).start()
     uvicorn.run(application, host=host, port=port)
 
 

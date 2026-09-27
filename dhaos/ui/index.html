@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dhaos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f6df5'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div id="app" class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-name">dhaos</span>
+      <span id="health-dot" class="health-dot" title="état du backend"></span>
+    </div>
+    <button id="new-chat" class="btn btn-primary btn-block">＋ Nouvelle conversation</button>
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">💬 Conversation</button>
+      <button class="tab" data-tab="kb">📚 Bases de savoir</button>
+      <button class="tab" data-tab="journal">🧾 Journal</button>
+      <button class="tab" data-tab="config">⚙️ Configuration</button>
+    </nav>
+    <div class="sidebar-section">
+      <div class="sidebar-title">Sessions <button id="refresh-sessions" class="icon-btn" title="rafraîchir">↻</button></div>
+      <ul id="sessions" class="sessions"></ul>
+    </div>
+    <div class="sidebar-footer">
+      <button id="theme-toggle" class="icon-btn" title="thème clair / sombre">◐</button>
+      <span id="version" class="muted"></span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <label class="field">
+          <span>Cerveau</span>
+          <select id="backend-select">
+            <option value="ollama">Ollama (local)</option>
+            <option value="claude">Claude (API)</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Modèle</span>
+          <input id="model-input" list="model-list" placeholder="défaut de la configuration" spellcheck="false">
+          <datalist id="model-list"></datalist>
+        </label>
+        <label class="field checkbox">
+          <input type="checkbox" id="tools-toggle" checked>
+          <span>Outils</span>
+        </label>
+      </div>
+      <div class="topbar-right">
+        <span id="project-root" class="muted mono" title="racine du projet"></span>
+        <span id="backend-status" class="pill"></span>
+      </div>
+    </header>
+
+    <!-- ============================================================ chat -->
+    <section id="tab-chat" class="tab-panel active">
+      <div id="messages" class="messages">
+        <div class="empty-state">
+          <div class="empty-mark"></div>
+          <h2>Bonjour.</h2>
+          <p>Posez une question, demandez une modification de code, une recherche web ou une consultation des bases de savoir.<br>
+             Les appels d'outils s'affichent au fil de l'eau ; les actions sensibles vous demandent confirmation ici même.</p>
+        </div>
+      </div>
+      <div id="activity" class="activity hidden"><span class="spinner"></span><span id="activity-label">le modèle lit le contexte…</span><span id="activity-time" class="muted"></span></div>
+      <form id="composer" class="composer">
+        <textarea id="prompt" rows="1" placeholder="Votre message… (Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne)"></textarea>
+        <button id="send" type="submit" class="btn btn-primary" title="envoyer">➤</button>
+      </form>
+      <div class="composer-meta muted"><span id="session-label">nouvelle session</span><span id="usage-label"></span></div>
+    </section>
+
+    <!-- ============================================================== kb -->
+    <section id="tab-kb" class="tab-panel">
+      <div class="kb-layout">
+        <div class="kb-list-pane">
+          <div class="pane-title">Bases <button id="refresh-kb" class="icon-btn" title="rafraîchir">↻</button></div>
+          <ul id="kb-list" class="kb-list"></ul>
+          <form id="kb-create" class="stack">
+            <input id="kb-new-name" placeholder="nom (ex. developpeur)" required pattern="[A-Za-z0-9._\- ]{1,64}">
+            <input id="kb-new-desc" placeholder="description (facultatif)">
+            <button class="btn btn-primary" type="submit">Créer la base</button>
+          </form>
+        </div>
+        <div class="kb-detail-pane">
+          <div id="kb-empty" class="empty-state small"><p>Sélectionnez une base, ou créez-en une. Une base est une catégorie de savoir (développeur, infra, projet…) que l'agent consulte avant de répondre.</p></div>
+          <div id="kb-detail" class="hidden">
+            <div class="kb-head">
+              <h2 id="kb-name"></h2>
+              <div class="kb-actions">
+                <button id="kb-rename" class="btn btn-ghost">Renommer</button>
+                <button id="kb-reindex" class="btn btn-ghost" title="recalculer les embeddings avec l'embedder courant">Réindexer</button>
+                <button id="kb-delete" class="btn btn-danger">Supprimer</button>
+              </div>
+            </div>
+            <div class="kb-desc-row">
+              <input id="kb-desc" placeholder="description montrée au modèle">
+              <button id="kb-desc-save" class="btn">Enregistrer</button>
+            </div>
+            <div id="kb-stats" class="stats"></div>
+
+            <h3>Ajouter des sources</h3>
+            <form id="kb-add" class="row">
+              <input id="kb-sources" placeholder="chemins de fichiers/dossiers ou URLs, séparés par des espaces ou des retours à la ligne" required>
+              <label class="checkbox"><input type="checkbox" id="kb-recursive" checked><span>récursif</span></label>
+              <button class="btn btn-primary" type="submit">Ingérer</button>
+            </form>
+            <form id="kb-note" class="row">
+              <input id="kb-note-title" placeholder="titre de la note" style="max-width:220px">
+              <input id="kb-note-text" placeholder="texte d'une note à mémoriser" required>
+              <button class="btn" type="submit">Ajouter la note</button>
+            </form>
+            <div id="kb-add-result" class="notice hidden"></div>
+
+            <h3>Rechercher</h3>
+            <form id="kb-search" class="row">
+              <input id="kb-query" placeholder="question ou mots-clés" required>
+              <select id="kb-mode"><option value="hybrid">hybride</option><option value="vector">vecteurs</option><option value="keyword">mots-clés</option></select>
+              <input id="kb-topk" type="number" min="1" max="50" value="5" title="nombre de passages" style="width:70px">
+              <button class="btn btn-primary" type="submit">Chercher</button>
+            </form>
+            <div id="kb-results" class="hits"></div>
+
+            <h3>Documents <span id="kb-doc-count" class="muted"></span></h3>
+            <ul id="kb-docs" class="docs"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================= journal -->
+    <section id="tab-journal" class="tab-panel">
+      <div class="pane-title">Journal des actions <button id="refresh-journal" class="icon-btn" title="rafraîchir">↻</button>
+        <span class="muted">écritures, modifications et commandes exécutées par l'agent</span></div>
+      <table class="table" id="journal-table"><thead><tr><th>Quand</th><th>Action</th><th>Détail</th><th>Résultat</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <!-- ========================================================== config -->
+    <section id="tab-config" class="tab-panel">
+      <div class="config-layout">
+        <div class="card">
+          <h3>Réglages courants</h3>
+          <p class="muted">Enregistrés dans le fichier de configuration et appliqués immédiatement.</p>
+          <form id="config-form" class="stack">
+            <label class="field"><span>Cerveau par défaut</span><select name="backends.default"><option value="ollama">ollama</option><option value="claude">claude</option></select></label>
+            <label class="field"><span>Modèle Ollama</span><input name="backends.ollama.model"></label>
+            <label class="field"><span>Hôte Ollama</span><input name="backends.ollama.host"></label>
+            <label class="field"><span>Modèle Claude</span><input name="backends.claude.model"></label>
+            <label class="field"><span>Écriture (write_policy)</span><select name="tools.write_policy"><option>project</option><option>ask</option><option>all</option><option>deny</option></select></label>
+            <label class="field"><span>Shell (shell_policy)</span><select name="tools.shell_policy"><option>ask</option><option>auto</option><option>deny</option></select></label>
+            <label class="field"><span>Embedder des bases</span><select name="kb.embedder"><option>auto</option><option>ollama</option><option>sentence-transformers</option><option>hash</option></select></label>
+            <label class="field"><span>Recherche web</span><select name="web.provider"><option>duckduckgo</option><option>searxng</option><option>brave</option></select></label>
+            <label class="field"><span>Langue des réponses</span><input name="agent.language" style="max-width:100px"></label>
+            <label class="field checkbox"><input type="checkbox" name="agent.auto_kb_search"><span>Consulter les bases de savoir automatiquement</span></label>
+            <button class="btn btn-primary" type="submit">Enregistrer</button>
+            <div id="config-result" class="notice hidden"></div>
+          </form>
+        </div>
+        <div class="card">
+          <h3>Configuration effective</h3>
+          <p class="muted">Secrets masqués. Fichier : <span id="config-path" class="mono"></span></p>
+          <pre id="config-dump" class="code-block"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ------------------------------------------------------------ modales -->
+<div id="token-modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>Jeton d'accès</h2>
+    <p>Cette interface parle à l'API locale de dhaos, protégée par un jeton. Il est affiché par <code>dhaos serve</code> au démarrage (ou défini par <code>api.token</code>).</p>
+    <form id="token-form" class="stack">
+      <input id="token-input" placeholder="coller le jeton" autocomplete="off" spellcheck="false">
+      <button class="btn btn-primary" type="submit">Se connecter</button>
+    </form>
+    <p id="token-error" class="error hidden"></p>
+  </div>
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

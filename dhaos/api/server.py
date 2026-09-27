@@ -36,24 +36,30 @@ import queue
 import secrets
 import sys
 import threading
+import time
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Iterator
+from urllib.parse import urlsplit
 
+import tomli_w
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__
 from ..agent.loop import Agent, AgentResult
 from ..agent.session import Session, SessionStore
-from ..backends import get_backend
+from ..backends import BACKEND_NAMES, get_backend
 from ..backends.base import Backend, BackendError
-from ..config import Settings
+from ..config import Settings, default_config_path
 from ..kb.ingest import iter_files
 from ..kb.manager import KnowledgeError, normalize_name
-from ..policy import AccessPolicy, Journal, auto_confirm, never_confirm
+from ..policy import AccessPolicy, Confirmer, Journal, auto_confirm, never_confirm
 from ..runtime import build_runtime
 from ..tools.base import ToolResult
 from ..types import ToolCall
@@ -94,6 +100,8 @@ def masked_config(settings: Settings) -> dict[str, Any]:
         node = data.get(section)
         if isinstance(node, dict) and node.get(key):
             node[key] = MASK
+    data["source_path"] = str(settings.source_path or default_config_path())
+    data["project_root"] = str(settings.resolve_project_root())
     return data
 
 
@@ -136,6 +144,13 @@ def _done_payload(result: AgentResult, session_id: str) -> dict[str, Any]:
         "tool_calls": result.tool_calls,
         "error": result.error,
     }
+
+
+UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+# Modèles Claude proposés dans l'interface (l'API Anthropic n'est pas interrogée).
+CLAUDE_MODELS: tuple[str, ...] = (
+    "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5-1", "claude-opus-4-8",
+)
 
 
 def host_name(header: str) -> str:
@@ -188,7 +203,13 @@ class HostOriginGuard:
             await response(scope, receive, send)
             return
         origin = headers.get("origin")
-        if origin is not None and "*" not in self.origins and normalize_origin(origin) not in self.origins:
+        same_origin = origin is not None and urlsplit(origin).netloc.lower() == headers.get("host", "").strip().lower()
+        if (
+            origin is not None
+            and not same_origin  # l'interface servie par cette API (Host déjà validé)
+            and "*" not in self.origins
+            and normalize_origin(origin) not in self.origins
+        ):
             response = JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
                 content={"detail": "origine navigateur non autorisée (voir api.allowed_origins)"},
@@ -196,6 +217,46 @@ class HostOriginGuard:
             await response(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+class ConfirmBroker:
+    """Demandes de confirmation en attente d'une réponse de l'interface web.
+
+    ``ask`` (appelé depuis le fil de l'agent) pousse un événement SSE
+    ``confirm`` {id, prompt} puis attend ``answer`` (``POST /chat/confirm``)
+    jusqu'à ``timeout`` secondes ; sans réponse, l'action est refusée."""
+
+    def __init__(self, timeout: float) -> None:
+        self.timeout = max(1.0, float(timeout))
+        self._lock = threading.Lock()
+        self._pending: dict[str, dict[str, Any]] = {}
+
+    def ask(self, prompt: str, session_id: str, events: "queue.Queue[Any]") -> bool:
+        cid = secrets.token_urlsafe(12)
+        entry: dict[str, Any] = {"event": threading.Event(), "answer": None, "session_id": session_id, "created": time.time()}
+        with self._lock:
+            self._pending[cid] = entry
+        events.put(("confirm", {"id": cid, "prompt": str(prompt), "session_id": session_id, "timeout": self.timeout}))
+        answered = entry["event"].wait(self.timeout)
+        with self._lock:
+            self._pending.pop(cid, None)
+        return bool(entry["answer"]) if answered else False
+
+    def answer(self, cid: str, value: bool) -> bool:
+        with self._lock:
+            entry = self._pending.get(cid)
+            if entry is None:
+                return False
+            entry["answer"] = bool(value)
+            entry["event"].set()
+            return True
+
+    def confirmer(self, session_id: str, events: "queue.Queue[Any]") -> Confirmer:
+        return lambda prompt: self.ask(prompt, session_id, events)
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._pending)
 
 
 class SessionLocks:
@@ -297,6 +358,7 @@ def create_app(
     policy = AccessPolicy(settings)
     kb_lock = threading.RLock()
     session_locks = SessionLocks()
+    confirm_broker = ConfirmBroker(settings.api.confirm_timeout)
 
     def close_kb() -> None:
         manager = getattr(app.state, "kb", None)
@@ -328,6 +390,7 @@ def create_app(
     app.state.kb_lock = kb_lock
     app.state.session_locks = session_locks
     app.state.close_kb = close_kb
+    app.state.confirm_broker = confirm_broker
     app.add_middleware(
         HostOriginGuard,
         allowed_hosts=allowed_hosts_for(settings),
@@ -395,6 +458,14 @@ def create_app(
         except (ValueError, BackendError) as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"backend indisponible : {e}") from e
 
+    # ------------------------------------------------------ interface web
+    if UI_DIR.is_dir():
+        app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
+
+        @app.get("/", include_in_schema=False)
+        def ui_index() -> FileResponse:
+            return FileResponse(UI_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
     # ------------------------------------------------------------- health
     @app.get("/health", response_model=S.HealthOut)
     def health(request: Request) -> S.HealthOut:
@@ -442,6 +513,73 @@ def create_app(
         )
 
     # ------------------------------------------------------------- config
+    @router.get("/models", response_model=S.ModelsOut)
+    def models(backend: str | None = Query(None, max_length=S.MAX_BACKEND_NAME_CHARS)) -> S.ModelsOut:
+        """Modèles proposés pour un backend : liste Ollama (``/api/tags``) ou
+        modèles Claude connus ; ``default`` = modèle configuré."""
+        name = (backend or settings.backends.default).lower()
+        if name not in BACKEND_NAMES:
+            return S.ModelsOut(backend=name, ok=False, detail=f"backend inconnu : {name} (attendu : {', '.join(BACKEND_NAMES)})")
+        if name == "claude":
+            cfg = settings.backends.claude
+            return S.ModelsOut(backend="claude", default=cfg.model, ok=True, models=list(CLAUDE_MODELS))
+        try:
+            instance = build_backend(name, None)
+            health = instance.healthcheck()
+        except HTTPException as e:
+            return S.ModelsOut(backend=name, ok=False, detail=str(e.detail))
+        except Exception as e:  # noqa: BLE001
+            return S.ModelsOut(backend=name, ok=False, detail=f"{type(e).__name__}: {e}")
+        return S.ModelsOut(
+            backend=name,
+            default=str(getattr(instance, "model", "") or ""),
+            ok=bool(health.get("ok")),
+            detail=str(health.get("detail") or ""),
+            models=[str(m) for m in (health.get("models") or [])],
+        )
+
+    @router.patch("/config")
+    def config_patch(body: S.ConfigPatch) -> dict[str, Any]:
+        """Modifie une clé courante (liste blanche), l'enregistre dans le
+        fichier TOML et l'applique à chaud."""
+        if body.key not in S.CONFIG_PATCH_KEYS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"clé non modifiable par l'API : {body.key}")
+        try:
+            updated = settings.with_override(body.key, body.value)
+        except ValidationError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"valeur invalide pour {body.key} : {e.errors()[0].get('msg', e)}") from e
+        parts = body.key.split(".")
+        new_value = updated
+        for part in parts:
+            new_value = getattr(new_value, part)
+        # Fichier : on repart du TOML brut (sans les surcharges d'environnement).
+        path = settings.source_path or default_config_path()
+        data: dict[str, Any] = {}
+        if path.is_file():
+            with contextlib.suppress(tomllib.TOMLDecodeError, OSError):
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+        node = data
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        serialized = new_value.model_dump(mode="json") if hasattr(new_value, "model_dump") else new_value
+        if isinstance(serialized, Path):
+            serialized = str(serialized)
+        if serialized is None:
+            node.pop(parts[-1], None)
+        else:
+            node[parts[-1]] = serialized
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tomli_w.dumps(data), encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"écriture de la configuration impossible : {e}") from e
+        # Application à chaud : on modifie les objets existants (partagés par la politique, les backends…).
+        target: Any = settings
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], new_value)
+        return {"key": body.key, "value": serialized, "path": str(path)}
+
     @router.get("/config")
     def config() -> dict[str, Any]:
         """Configuration effective, secrets masqués."""
@@ -561,6 +699,12 @@ def create_app(
             summary=report.summary(),
         )
 
+    @router.post("/kb/{name}/reindex", response_model=S.ReindexOut)
+    def kb_reindex(name: str) -> S.ReindexOut:
+        info = require_base(name)
+        with kb_lock, _kb_errors():
+            return S.ReindexOut(chunks=int(current_kb().reindex(info.name)))
+
     @router.post("/kb/{name}/notes", response_model=S.NoteOut)
     def kb_add_note(name: str, body: S.NoteAdd) -> S.NoteOut:
         title = " ".join(body.title.split()) if body.title else None
@@ -607,11 +751,15 @@ def create_app(
 
         if not session_locks.acquire(session.id):
             raise HTTPException(status.HTTP_409_CONFLICT, f"session occupée : {session.id}")
+        events: "queue.Queue[Any]" = queue.Queue()
+        # En flux, l'interface peut répondre aux confirmations ; sinon la
+        # politique configurée s'applique (auto_confirm ou refus).
+        turn_confirm = confirm if (settings.api.auto_confirm or not body.stream) else confirm_broker.confirmer(session.id, events)
         try:
             runtime = build_runtime(
                 settings,
                 backend=backend,
-                confirm=confirm,
+                confirm=turn_confirm,
                 session=session,
                 kb=app.state.kb,
                 tools=not body.no_tools,
@@ -640,8 +788,6 @@ def create_app(
                 error=result.error,
             )
 
-        events: "queue.Queue[Any]" = queue.Queue()
-
         def worker() -> None:
             failed = True
             try:
@@ -655,6 +801,13 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-Id": session.id},
         )
+
+    @router.post("/chat/confirm")
+    def chat_confirm(body: S.ConfirmAnswer) -> dict[str, Any]:
+        """Réponse à une demande de confirmation reçue en SSE (``event: confirm``)."""
+        if not confirm_broker.answer(body.id, body.answer):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "demande de confirmation inconnue ou expirée")
+        return {"accepted": True, "id": body.id, "answer": body.answer}
 
     # ------------------------------------------------------------ sessions
     @router.get("/sessions", response_model=list[S.SessionInfoOut])
@@ -718,6 +871,7 @@ def main() -> None:
 
 __all__ = [
     "BackendFactory",
+    "ConfirmBroker",
     "HostOriginGuard",
     "KBFactory",
     "LOCAL_HOSTS",

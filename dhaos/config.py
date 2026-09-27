@@ -224,6 +224,9 @@ class APIConfig(BaseModel):
     # requête portant un en-tête Origin est refusée (aucun client navigateur
     # attendu, protection contre le DNS rebinding).
     allowed_origins: list[str] = Field(default_factory=list)
+    # Délai (s) accordé à l'interface web pour répondre à une demande de
+    # confirmation ; passé ce délai l'action est refusée.
+    confirm_timeout: float = 300.0
     # L'API n'a personne à qui demander : False => les actions qui exigent une
     # confirmation sont refusées ; True => confirmées automatiquement (dangereux).
     auto_confirm: bool = False

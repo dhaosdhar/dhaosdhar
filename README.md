@@ -242,6 +242,23 @@ dhaos config set agent.max_iterations 60  # valeur validée (clé inconnue ou ty
 
 `config.example.toml` à la racine du dépôt documente chaque section.
 
+## Interface web
+
+`dhaos serve` sert aussi une **interface web** sur la même adresse (`http://127.0.0.1:8642/`) :
+conversation en flux avec les appels d'outils affichés au fil de l'eau, **confirmations interactives**
+(« Exécuter : make install ? » — Oui / Non, dans la page), choix du cerveau et du modèle, gestion
+complète des bases de savoir (créer, ingérer fichiers/dossiers/URLs, notes, recherche, renommer,
+réindexer, supprimer), sessions, journal des actions et réglages courants. Sans dépendance externe,
+utilisable hors ligne, thème clair/sombre.
+
+```sh
+dhaos serve --open          # lance l'API et ouvre l'interface dans le navigateur
+```
+
+Au démarrage, `dhaos serve` affiche l'URL de l'interface **avec le jeton** (`/?token=…`) : la page le
+mémorise dans le navigateur et le retire de l'adresse. Avec `api.token` défini, la page le demande
+une fois. Les confirmations attendent `api.confirm_timeout` secondes (300) avant de refuser l'action.
+
 ## API HTTP
 
 ```sh
@@ -270,6 +287,11 @@ documentation interactive sur `/docs`.
 | `POST /kb/{name}/documents` | ingérer `{"sources": [chemins ou URLs], "recursive"?}` (chaque fichier, y compris dans un dossier, est soumis à la politique de lecture : `tools.deny_patterns`) |
 | `DELETE /kb/{name}/documents` | retirer un document : corps `{"source"}` ou `?source=` |
 | `POST /kb/{name}/notes` | ajouter une note `{"text", "title"?}` |
+| `GET /` · `GET /ui/*` | interface web (sans jeton : aucun secret dans la page) |
+| `GET /models?backend=` | modèles disponibles (liste Ollama, modèles Claude connus) |
+| `PATCH /config` | `{"key", "value"}` : modifie un réglage courant (liste blanche), fichier + application à chaud |
+| `POST /kb/{name}/reindex` | recalcule les embeddings de la base |
+| `POST /chat/confirm` | `{"id", "answer"}` : réponse à un événement SSE `confirm` |
 | `POST /chat` | un tour d'agent : `{"message", "session_id"?, "backend"?, "model"?, "stream"? (true), "no_tools"?}` |
 | `GET /sessions` · `GET /sessions/{id}` · `DELETE /sessions/{id}` | sessions persistées |
 | `GET /journal?n=50` | dernières entrées du journal (1 à 1000) |
@@ -285,7 +307,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 # → {"text": "…", "session_id": "20260926-162649-1c59", "usage": {…}, "stop_reason": "end_turn",
 #    "iterations": 1, "tool_calls": 0, "error": null}
 
-# chat en flux SSE (défaut) : événements text, thinking, tool_call, tool_result, done, error
+# chat en flux SSE (défaut) : événements text, thinking, tool_call, tool_result, confirm, done, error
 curl -sN -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:8642/chat -d '{"message": "Résume docs/ARCHITECTURE.md", "session_id": "20260926-162649-1c59"}'
 # event: text

@@ -2,9 +2,10 @@
 réelles sous tmp_path avec l'embedder hash, sans réseau)."""
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -335,7 +336,7 @@ def test_config_masks_secrets(settings: Settings) -> None:
     assert body["web"]["brave_api_key"] == "***"
     assert body["kb"]["embedder"] == "hash"
     assert body["backends"]["default"] == settings.backends.default
-    assert "source_path" not in body
+    assert isinstance(body["source_path"], str) and isinstance(body["project_root"], str)  # utilisés par l'interface
     assert "s3cret" not in r.text and "brave-key" not in r.text
 
 
@@ -929,3 +930,197 @@ def test_default_kb_factory_used_when_none(settings: Settings) -> None:
     with local_client(app) as client:
         assert isinstance(client.app.state.kb, KnowledgeManager)
         assert client.get("/kb").json() == []
+
+
+# ------------------------------------------------------------ interface web
+def test_ui_page_and_assets_served_without_token(api) -> None:
+    client, _ = api
+    r = client.get("/", headers=without_auth(client))
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert "dhaos" in r.text and "/ui/app.js" in r.text and "/ui/style.css" in r.text
+    js = client.get("/ui/app.js", headers=without_auth(client))
+    assert js.status_code == 200 and "javascript" in js.headers["content-type"]
+    assert "/chat/confirm" in js.text
+    css = client.get("/ui/style.css", headers=without_auth(client))
+    assert css.status_code == 200 and "css" in css.headers["content-type"]
+    assert client.get("/ui/../pyproject.toml", headers=without_auth(client)).status_code == 404
+
+
+def test_same_origin_requests_allowed_foreign_origin_refused(api) -> None:
+    """La page servie par l'API envoie ``Origin`` = sa propre adresse : accepté ;
+    une autre origine reste refusée (rebinding, site tiers)."""
+    client, _ = api
+    assert client.get("/kb", headers={"Origin": "http://127.0.0.1"}).status_code == 200
+    assert client.post("/kb/search", json={"query": "x"}, headers={"Origin": "http://127.0.0.1"}).status_code == 200
+    r = client.get("/kb", headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+
+
+def test_models_endpoint(api, settings: Settings) -> None:
+    client, _ = api
+    claude = client.get("/models", params={"backend": "claude"}).json()
+    assert claude["backend"] == "claude" and "claude-opus-5" in claude["models"] and claude["default"] == settings.backends.claude.model
+    fake = client.get("/models", params={"backend": "ollama"}).json()  # la fabrique renvoie un FakeBackend
+    assert fake["ok"] is True and fake["default"] == "fake-model" and fake["models"] == []
+    assert client.get("/models", params={"backend": "inconnu"}).json()["ok"] is False
+
+
+def test_kb_reindex_endpoint(api) -> None:
+    client, _ = api
+    client.post("/kb", json={"name": "dev"})
+    client.post("/kb/dev/notes", json={"text": "Le port du serveur est 8443.", "title": "port"})
+    r = client.post("/kb/dev/reindex")
+    assert r.status_code == 200 and r.json()["chunks"] >= 1
+    assert client.post("/kb/absente/reindex").status_code == 404
+
+
+def test_config_patch_writes_file_and_applies_live(api, settings: Settings, tmp_path: Path) -> None:
+    client, _ = api
+    cfg = client.get("/config").json()
+    assert cfg["source_path"] and cfg["project_root"] == str(settings.resolve_project_root())
+    r = client.patch("/config", json={"key": "backends.default", "value": "claude"})
+    assert r.status_code == 200, r.text
+    assert settings.backends.default == "claude"  # appliqué à chaud
+    text = Path(r.json()["path"]).read_text(encoding="utf-8")
+    assert 'default = "claude"' in text
+    r = client.patch("/config", json={"key": "agent.auto_kb_search", "value": False})
+    assert r.status_code == 200 and settings.agent.auto_kb_search is False
+    assert 'auto_kb_search = false' in Path(r.json()["path"]).read_text(encoding="utf-8")
+    assert client.patch("/config", json={"key": "tools.write_policy", "value": "bogus"}).status_code == 400
+    assert client.patch("/config", json={"key": "api.token", "value": "x"}).status_code == 400
+    assert client.patch("/config", json={"key": "tools.deny_patterns", "value": []}).status_code == 400
+    assert settings.tools.write_policy == "project"
+
+
+@contextlib.contextmanager
+def live_server(app: Any) -> Iterator[str]:
+    """Vrai serveur uvicorn dans un thread (le ``TestClient`` sérialise les
+    requêtes et ne délivre pas un flux SSE au fil de l'eau) ; renvoie l'URL."""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    assert server.started, "serveur uvicorn non démarré"
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def _stream_with_confirm(base_url: str, token: str, payload: dict[str, Any], answer: bool | None) -> list[tuple[str, Any]]:
+    """Lit le flux SSE d'un vrai serveur et, sur ``confirm``, répond via
+    ``POST /chat/confirm`` pendant que le flux est ouvert."""
+    import httpx
+
+    events: list[tuple[str, Any]] = []
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as client:
+        with client.stream("POST", "/chat", json=payload) as r:
+            assert r.status_code == 200
+            buffer = ""
+            for chunk in r.iter_text():
+                buffer += chunk
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    for event, data in parse_sse(block + "\n\n"):
+                        events.append((event, data))
+                        if event == "confirm" and answer is not None:
+                            reply = client.post("/chat/confirm", json={"id": data["id"], "answer": answer})
+                            assert reply.status_code == 200, reply.text
+    return events
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_chat_stream_confirmation_flow(settings: Settings, project_root: Path, answer: bool) -> None:
+    """Commande hors liste blanche : l'agent demande confirmation dans le flux
+    (``event: confirm``) ; ``oui`` exécute, ``non`` refuse."""
+    from dhaos.api.server import create_app
+
+    settings.tools.shell_policy = "ask"
+    settings.api.confirm_timeout = 10.0
+    settings.api.token = "t-confirm"
+    responses: list[str | ChatResponse] = [
+        tool_response(tool_call("run_command", "c1", command="touch confirme.txt")),
+        "Terminé.",
+    ]
+    app = create_app(settings, backend_factory=BackendFactory(responses), kb_factory=KnowledgeManager)
+    with live_server(app) as base_url:
+        events = _stream_with_confirm(base_url, "t-confirm", {"message": "crée le fichier", "stream": True}, answer)
+    kinds = [e for e, _ in events]
+    assert kinds == ["tool_call", "confirm", "tool_result", "text", "done"], kinds
+    confirm = events[1][1]
+    assert confirm["prompt"].startswith("Exécuter : touch confirme.txt") and confirm["id"]
+    result = events[2][1]
+    assert result["is_error"] is (not answer)
+    assert (project_root / "confirme.txt").exists() is answer
+    if not answer:
+        assert "refus" in result["preview"]
+
+
+def test_chat_stream_confirmation_timeout_refuses(settings: Settings, project_root: Path) -> None:
+    from dhaos.api.server import create_app
+
+    settings.tools.shell_policy = "ask"
+    settings.api.confirm_timeout = 1.0
+    settings.api.token = "t-timeout"
+    app = create_app(settings, backend_factory=BackendFactory([tool_response(tool_call("run_command", "c1", command="touch tard.txt")), "ok"]), kb_factory=KnowledgeManager)
+    with live_server(app) as base_url:
+        events = _stream_with_confirm(base_url, "t-timeout", {"message": "x", "stream": True}, None)
+    kinds = [e for e, _ in events]
+    assert kinds == ["tool_call", "confirm", "tool_result", "text", "done"]
+    assert events[2][1]["is_error"] is True and not (project_root / "tard.txt").exists()
+    assert app.state.confirm_broker.pending() == 0
+
+
+def test_chat_confirm_unknown_id_is_404(api) -> None:
+    client, _ = api
+    assert client.post("/chat/confirm", json={"id": "nope", "answer": True}).status_code == 404
+
+
+def test_chat_non_stream_does_not_wait_for_confirmation(settings: Settings, project_root: Path) -> None:
+    """Sans flux, personne ne peut répondre : la politique configurée s'applique (refus)."""
+    settings.tools.shell_policy = "ask"
+    client, _ = make_client(settings, [tool_response(tool_call("run_command", "c1", command="touch nonstream.txt")), "ok"])
+    with client:
+        r = client.post("/chat", json={"message": "x", "stream": False})
+    assert r.status_code == 200 and r.json()["tool_calls"] == 1
+    assert not (project_root / "nonstream.txt").exists()
+
+
+def test_chat_confirm_endpoint_answers_pending_request(api) -> None:
+    """``POST /chat/confirm`` débloque une demande en attente (le fil de l'agent
+    est simulé par un thread qui appelle ``ConfirmBroker.ask``)."""
+    import queue
+    import threading
+
+    client, _ = api
+    broker = client.app.state.confirm_broker
+    events: "queue.Queue[Any]" = queue.Queue()
+    outcome: dict[str, Any] = {}
+
+    def agent_side() -> None:
+        outcome["answer"] = broker.ask("Exécuter : rm -rf build ? ", "s1", events)
+
+    t = threading.Thread(target=agent_side, daemon=True)
+    t.start()
+    event, data = events.get(timeout=5)
+    assert event == "confirm" and data["prompt"].startswith("Exécuter") and data["session_id"] == "s1"
+    r = client.post("/chat/confirm", json={"id": data["id"], "answer": True})
+    assert r.status_code == 200 and r.json()["accepted"] is True
+    t.join(timeout=5)
+    assert outcome["answer"] is True and broker.pending() == 0
+    assert client.post("/chat/confirm", json={"id": data["id"], "answer": True}).status_code == 404
