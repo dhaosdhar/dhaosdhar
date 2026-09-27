@@ -134,7 +134,7 @@ def test_kb_search_hits(kb_ctx: ToolContext, kb: FakeKB, registry: ToolRegistry)
     kb.add_text("ops", "pytest tourne aussi en CI.")
     result = registry.execute(tool_call("kb_search", query="pytest"), kb_ctx)
     assert result.is_error is False
-    assert kb.search_calls == [{"query": "pytest", "bases": None, "top_k": None, "mode": "hybrid"}]
+    assert kb.search_calls == [{"query": "pytest", "bases": None, "top_k": 5, "mode": "hybrid"}]
     assert result.content == (
         "[1] ops/note:3 (score 0.53)\npytest tourne aussi en CI.\n\n"
         "[2] dev/note:tests (score 0.51)\nUtiliser pytest pour les tests."
@@ -327,3 +327,21 @@ def test_unexpected_exception_never_escapes(kb_ctx: ToolContext, kb: FakeKB, reg
     result = registry.execute(tool_call("kb_search", query="x"), kb_ctx)
     assert result.is_error is True
     assert result.content == "RuntimeError: sqlite verrouillé"
+
+
+def test_kb_search_truncates_long_passages(kb_ctx: ToolContext, kb: FakeKB, registry: ToolRegistry) -> None:
+    """Les passages renvoyés à l'agent sont tronqués (modèles locaux lents) ;
+    la note finale renvoie vers read_file pour le texte complet."""
+    from dhaos.tools.knowledge import format_hits
+    from dhaos.kb.manager import Hit
+
+    long_text = "mot " * 1000
+    hits = [Hit(base="dev", source="a.md", title="a", text=long_text, score=0.9, chunk_ord=0, doc_id=1)]
+    out = format_hits(hits, 700)
+    assert len(out) < 900 and "[…]" in out and "1 passage(s) tronqué(s) à 700" in out
+    assert format_hits(hits, None).count("mot") == 1000  # sans limite : intégral
+    kb_ctx.settings.kb.tool_snippet_chars = 50
+    kb.create_base("dev")
+    kb.add_text("dev", long_text, title="long")
+    result = registry.execute(tool_call("kb_search", query="mot"), kb_ctx)
+    assert not result.is_error and "[…]" in result.content and len(result.content) < 300

@@ -71,7 +71,6 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 _DEBUG = bool(os.environ.get("DHAOS_DEBUG"))
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.DOTALL)
 _FENCE_RE = re.compile(r"```(?:json|tool_call|tool)?[ \t]*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
-_TEXT_CALL_PREFIXES = ("{", "[", "<tool_call>", "```")
 
 
 def _debug(msg: str) -> None:
@@ -175,38 +174,89 @@ def rescue_text_tool_calls(text: str, tool_names: set[str]) -> tuple[str, list[d
 
 
 class _TextGate:
-    """Retient la diffusion du texte tant qu'il peut s'agir d'un appel d'outil
-    écrit en clair (début ``{``, ``[``, ``<tool_call>`` ou ```) ; tout autre
-    début est diffusé immédiatement, puis le reste au fil de l'eau."""
+    """Diffuse le texte au fil de l'eau, mais retient la fin de la réponse dès
+    qu'elle ressemble à un appel d'outil écrit en clair : ``{`` ou ``[`` en
+    début de ligne, ``<tool_call>`` n'importe où, ou un bloc ```json /
+    ```tool_call. À la fin du tour, le texte retenu est abandonné si des
+    appels ont été récupérés dedans, sinon diffusé tel quel."""
+
+    LINE_MARKERS = ("{", "[", "```json", "```tool_call", "```tool")
+    ANY_MARKERS = ("<tool_call>",)
 
     def __init__(self, on_text: TextCallback | None, enabled: bool):
         self.on_text = on_text
-        self.buffer = ""
-        self.passthrough = on_text is None or not enabled
+        self.enabled = bool(enabled) and on_text is not None
+        self.buffer = ""  # texte retenu (à partir du marqueur)
+        self.pending = ""  # fin de chunk qui pourrait être l'amorce d'un marqueur
+        self.holding = False
+        self.at_line_start = True
 
+    # ----------------------------------------------------------- détection
+    def _marker_index(self, text: str) -> int | None:
+        best: int | None = None
+        for marker in self.ANY_MARKERS:
+            i = text.find(marker)
+            if i != -1 and (best is None or i < best):
+                best = i
+        pos = 0
+        while True:
+            if pos > 0 or self.at_line_start:
+                stripped = text[pos:].lstrip(" \t")
+                offset = pos + (len(text) - pos - len(stripped))
+                if any(stripped.startswith(m) for m in self.LINE_MARKERS) and (best is None or offset < best):
+                    best = offset
+            nl = text.find("\n", pos)
+            if nl == -1:
+                return best
+            pos = nl + 1
+
+    @classmethod
+    def _partial_marker_len(cls, text: str) -> int:
+        """Longueur du suffixe de ``text`` qui est un préfixe strict d'un marqueur
+        multi-caractères (« <tool_ », « `` »…) : on l'attend avant de diffuser."""
+        best = 0
+        for marker in cls.ANY_MARKERS + tuple(m for m in cls.LINE_MARKERS if len(m) > 1):
+            for k in range(1, len(marker)):
+                if text.endswith(marker[:k]):
+                    best = max(best, k)
+        return best
+
+    # -------------------------------------------------------------- flux
     def feed(self, chunk: str) -> None:
         if self.on_text is None:
             return
-        if self.passthrough:
+        if not self.enabled:
             self.on_text(chunk)
             return
-        self.buffer += chunk
-        head = self.buffer.lstrip()
-        if not head:
+        if self.holding:
+            self.buffer += chunk
             return
-        if any(head.startswith(p) or p.startswith(head) for p in _TEXT_CALL_PREFIXES):
-            return  # candidat : on retient
-        self.passthrough = True
-        self.on_text(self.buffer)
-        self.buffer = ""
-
-    def finish(self, replacement: str | None = None) -> None:
-        if self.on_text is None or self.passthrough:
+        text = self.pending + chunk
+        self.pending = ""
+        idx = self._marker_index(text)
+        if idx is not None:
+            head, tail = text[:idx], text[idx:]
+            if head:
+                self.on_text(head)
+            self.holding = True
+            self.buffer = tail
             return
-        text = self.buffer if replacement is None else replacement
-        self.buffer = ""
+        keep = self._partial_marker_len(text)
+        if keep:
+            self.pending = text[-keep:]
+            text = text[:-keep]
         if text:
             self.on_text(text)
+            self.at_line_start = text.rstrip(" \t").endswith("\n") or (text.strip() == "" and self.at_line_start)
+
+    def finish(self, rescued: bool = False) -> None:
+        if self.on_text is None or not self.enabled:
+            return
+        leftover = self.buffer if self.holding else self.pending
+        self.buffer = self.pending = ""
+        self.holding = False
+        if leftover and not rescued:
+            self.on_text(leftover)
 
 
 class OllamaBackend(Backend):
@@ -392,6 +442,7 @@ class OllamaBackend(Backend):
             )
 
         text = "".join(text_parts)
+        rescued_any = False
         if tools and not tool_calls:
             # Petits modèles locaux : l'appel d'outil arrive parfois en texte
             # (JSON nu, <tool_call>, bloc ```json) au lieu de message.tool_calls.
@@ -402,8 +453,8 @@ class OllamaBackend(Backend):
                     raw_tool_calls.append({"function": {"name": call["name"], "arguments": call["arguments"]}})
                     tool_calls.append(ToolCall(id=_new_call_id(), name=call["name"], arguments=call["arguments"]))
                 text = remainder
-                gate.finish(replacement=remainder)
-        gate.finish()
+                rescued_any = True
+        gate.finish(rescued=rescued_any)
         raw: dict[str, Any] = {"role": "assistant", "content": text}
         if thinking_parts:
             raw["thinking"] = "".join(thinking_parts)

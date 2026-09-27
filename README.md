@@ -399,6 +399,11 @@ free -h                                                 # RAM disponible et swap
 | `prompt eval rate` 50–150 tok/s mais réponse longue | débit normal d'un 7B sur CPU (4–10 tok/s en génération) | modèle plus petit pour les tâches simples, Claude (`--backend claude`) pour les tâches lourdes, GPU |
 | 30–60 s avant le premier appel d'outil | lecture du prompt système et des schémas d'outils (~2 000 tokens) ; ensuite Ollama réutilise le cache du préfixe | normal ; `--no-tools` pour une question sans action |
 
+Un changement de modèle ne décharge pas l'ancien (`ollama ps` les liste ; `keep_alive` les garde) :
+`ollama stop qwen2.5-coder:7b` libère sa mémoire. Les passages renvoyés à l'agent par `kb_search`
+sont tronqués (`kb.tool_snippet_chars`, 700 par défaut, `kb.tool_top_k` passages) : huit chunks entiers
+représentent 4 000 tokens qu'un modèle local met plusieurs minutes à lire.
+
 Ordre de grandeur mémoire : poids du modèle (7B Q4 ≈ 4,7 Go ; 3B ≈ 1,9 Go ; 1,5B ≈ 1 Go) + KV cache
 (≈ 0,9 Go pour 16 k de contexte sur un 7B) + le reste de la machine. `keep_alive = "30m"` évite de recharger
 le modèle (≈ 20 s) entre deux requêtes.

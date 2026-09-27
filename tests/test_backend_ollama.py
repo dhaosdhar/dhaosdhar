@@ -597,3 +597,51 @@ def test_chat_structured_tool_call_wins_over_text(settings: Settings) -> None:
     backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
     resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR])
     assert [c.name for c in resp.tool_calls] == ["list_dir"] and resp.text == "ok"
+
+
+def _stream_chunks(*chunks: str) -> list[dict[str, Any]]:
+    return [{"message": {"role": "assistant", "content": c}, "done": False} for c in chunks]
+
+
+def test_gate_holds_json_after_prose_and_drops_it_when_rescued(settings: Settings) -> None:
+    """Prose puis appel JSON sur une nouvelle ligne : la prose est diffusée, le JSON jamais."""
+    stream = _stream_chunks("Je regarde.\n", '{"name": "list_dir", ', '"arguments": {"path": "."}}')
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
+    assert shown == ["Je regarde.\n"]
+    assert [c.name for c in resp.tool_calls] == ["list_dir"] and resp.text == "Je regarde."
+
+
+def test_gate_inline_brace_in_prose_streams_normally(settings: Settings) -> None:
+    stream = _stream_chunks("Le dict ", '{"a": 1} est ', "valide.")
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
+    assert "".join(shown) == resp.text == 'Le dict {"a": 1} est valide.' and len(shown) == 3
+
+
+def test_gate_partial_tool_call_tag_across_chunks(settings: Settings) -> None:
+    stream = _stream_chunks("Voici <tool_", 'call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>')
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
+    assert "".join(shown) == "Voici " and [c.name for c in resp.tool_calls] == ["list_dir"]
+
+
+def test_gate_python_code_block_streams(settings: Settings) -> None:
+    text = "Exemple :\n```python\nd = {\"a\": 1}\nprint(d)\n```\nVoilà."
+    stream = _stream_chunks(*[text[i : i + 7] for i in range(0, len(text), 7)])
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
+    assert "".join(shown) == text and resp.tool_calls == []
+
+
+def test_gate_json_block_not_a_call_is_flushed(settings: Settings) -> None:
+    text = 'Config :\n```json\n{"debug": true}\n```'
+    stream = _stream_chunks(text[:12], text[12:])
+    backend, _ = make_backend(settings, chat_stream(*stream, done_chunk()))
+    shown: list[str] = []
+    resp = backend.chat([Message(role="user", content="x")], tools=[LIST_DIR], on_text=shown.append)
+    assert "".join(shown) == text and resp.text == text and resp.tool_calls == []

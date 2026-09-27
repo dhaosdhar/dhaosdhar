@@ -51,17 +51,26 @@ def format_base_line(info: Any) -> str:
     return f"{head} ({n_docs} docs, {n_chunks} chunks)"
 
 
-def format_hits(hits: list[Any]) -> str:
+def format_hits(hits: list[Any], snippet_chars: int | None = None) -> str:
+    """Passages numérotés ; chaque texte est tronqué à ``snippet_chars`` (les
+    modèles locaux lisent lentement : 8 chunks entiers = plusieurs minutes)."""
     if not hits:
         return "aucun résultat"
     blocks: list[str] = []
+    truncated = 0
     for i, hit in enumerate(hits, start=1):
         base = getattr(hit, "base", "") or "?"
         source = getattr(hit, "source", "") or getattr(hit, "title", "") or "?"
         score = float(getattr(hit, "score", 0.0) or 0.0)
         text = str(getattr(hit, "text", "") or "").strip()
+        if snippet_chars and len(text) > snippet_chars:
+            text = text[:snippet_chars].rstrip() + " […]"
+            truncated += 1
         blocks.append(f"[{i}] {base}/{source} (score {score:.2f})\n{text}")
-    return "\n\n".join(blocks)
+    out = "\n\n".join(blocks)
+    if truncated:
+        out += f"\n\n({truncated} passage(s) tronqué(s) à {snippet_chars} caractères ; read_file sur la source pour le texte complet)"
+    return out
 
 
 class KBListTool(Tool):
@@ -112,7 +121,7 @@ class KBSearchTool(Tool):
                 "type": "integer",
                 "minimum": 1,
                 "maximum": MAX_TOP_K,
-                "description": "Nombre maximal de passages (défaut : kb.top_k).",
+                "description": "Nombre maximal de passages (défaut : kb.tool_top_k).",
             },
         },
         "required": ["query"],
@@ -125,14 +134,16 @@ class KBSearchTool(Tool):
         raw_bases = args.get("bases") or []
         bases = [b for b in (" ".join(str(x).split()) for x in raw_bases) if b] or None
         top_k = args.get("top_k")
-        if top_k is not None:
-            top_k = max(1, min(int(top_k), MAX_TOP_K))
+        if top_k is None:
+            top_k = int(getattr(ctx.settings.kb, "tool_top_k", 5) or 5)
+        top_k = max(1, min(int(top_k), MAX_TOP_K))
+        snippet = int(getattr(ctx.settings.kb, "tool_snippet_chars", 700) or 0) or None
         try:
             hits = list(kb.search(query, bases=bases, top_k=top_k))
         except KnowledgeError as e:
             raise ToolError(str(e)) from e
         return ToolResult(
-            format_hits(hits),
+            format_hits(hits, snippet),
             data=[
                 {
                     "base": getattr(h, "base", ""),

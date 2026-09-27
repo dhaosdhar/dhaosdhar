@@ -189,7 +189,9 @@ class KBConfig(BaseModel):
     hash_dim: int = 512
     chunk_chars: int = 2400
     chunk_overlap: int = 300
-    top_k: int = 8
+    top_k: int = 8  # résultats de `dhaos kb search`
+    tool_top_k: int = 5  # passages renvoyés à l'agent par kb_search (si top_k non précisé)
+    tool_snippet_chars: int = 700  # longueur max d'un passage renvoyé à l'agent (modèles locaux : contexte et débit limités)
     max_file_bytes: int = 5_000_000
     ignore_patterns: list[str] = Field(
         default_factory=lambda: [
