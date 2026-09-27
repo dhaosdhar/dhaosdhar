@@ -48,7 +48,7 @@ if [ "$SKIP_OLLAMA" = 0 ]; then
     if [ "$AVAIL_MB" -ge 9000 ]; then MODEL="qwen2.5-coder:7b"; else MODEL="qwen2.5-coder:3b"; fi
     echo "Mémoire : ${TOTAL_MB} Mo au total, ${AVAIL_MB} Mo disponibles → modèle proposé : $MODEL"
   fi
-  echo "Téléchargement des modèles (une seule fois) : $MODEL et $EMBED"
+  echo "Téléchargement des poids (une seule fois) : $MODEL (base de dhaos) et $EMBED (embeddings)"
   ollama pull "$MODEL"
   ollama pull "$EMBED"
 fi
@@ -58,7 +58,8 @@ DH=${DHAOS_BIN:-dhaos}
 CFG=$($DH config path)
 [ -f "$CFG" ] || $DH config init >/dev/null
 if [ -n "$MODEL" ]; then
-  $DH config set backends.ollama.model "$MODEL" >/dev/null
+  # Le modèle « dhaos » = poids du modèle de base + identité dhaos ; devient le modèle par défaut.
+  $DH model create --base "$MODEL" --name dhaos
   $DH config set backends.ollama.embed_model "$EMBED" >/dev/null
   $DH config set backends.ollama.keep_alive 30m >/dev/null
   if [ "${TOTAL_MB:-0}" -gt 0 ] && [ "$TOTAL_MB" -lt 16000 ]; then $DH config set backends.ollama.num_ctx 8192 >/dev/null; fi

@@ -55,6 +55,8 @@ app.add_typer(kb_app, name="kb")
 app.add_typer(config_app, name="config")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(train_app, name="train")
+model_app = typer.Typer(no_args_is_help=True, help="Modèle Ollama « dhaos » : création, liste, détail, suppression.")
+app.add_typer(model_app, name="model")
 
 
 class BackendChoice(str, Enum):
@@ -1119,6 +1121,130 @@ def train_lora(
         fail(f"fine-tuning impossible : {e}")
         return
     success(f"Adaptateur LoRA enregistré dans {path}")
+
+
+# ======================================================================= model
+def _ollama_backend(ctx: typer.Context) -> Any:
+    settings = _settings(ctx)
+    from ..backends.ollama import OllamaBackend
+
+    return settings, OllamaBackend(settings)
+
+
+@model_app.command("create")
+def model_create(
+    ctx: typer.Context,
+    base: str | None = typer.Option(None, "--base", help="Modèle de base Ollama (défaut : backends.ollama.base_model)."),
+    name: str = typer.Option("dhaos", "--name", help="Nom du modèle créé."),
+    num_ctx: int | None = typer.Option(None, "--num-ctx", min=512, help="Fenêtre de contexte (défaut : backends.ollama.num_ctx)."),
+    set_default: bool = typer.Option(True, "--set-default/--no-set-default", help="Enregistrer ce modèle comme modèle par défaut."),
+) -> None:
+    """Créer le modèle Ollama « dhaos » : poids du modèle de base + identité dhaos + paramètres.
+
+    Le modèle de base doit être présent (`ollama pull`). Aucun poids n'est
+    dupliqué : Ollama partage les couches entre les deux modèles.
+    """
+    from ..agent.prompts import MODEL_IDENTITY
+    from ..backends.base import BackendError
+
+    settings, backend = _ollama_backend(ctx)
+    base = base or settings.backends.ollama.base_model
+    params: dict[str, Any] = {}
+    ctx_size = num_ctx or settings.backends.ollama.num_ctx
+    if ctx_size:
+        params["num_ctx"] = int(ctx_size)
+    try:
+        present = backend.list_models()
+        if not any(m == base or m.split(":")[0] == base for m in present):
+            fail(f"modèle de base absent : {base} — lancez : ollama pull {base}")
+            raise typer.Exit(1)
+        note(f"création de {name} à partir de {base}…")
+        result = backend.create_model(name, base, system=MODEL_IDENTITY, parameters=params)
+    except BackendError as e:
+        fail(str(e))
+        raise typer.Exit(1) from e
+    status_text = str(result.get("status", "")) if isinstance(result, dict) else ""
+    success(f"modèle {name} créé ({status_text or 'ok'}) — base : {base}")
+    if set_default:
+        _write_config_keys(settings, {"backends.ollama.model": name, "backends.ollama.base_model": base})
+        success(f"modèle par défaut : {name} (backends.ollama.model)")
+
+
+@model_app.command("list")
+def model_list(ctx: typer.Context) -> None:
+    """Modèles présents dans Ollama."""
+    from ..backends.base import BackendError
+
+    settings, backend = _ollama_backend(ctx)
+    try:
+        models = backend.list_models()
+    except BackendError as e:
+        fail(str(e))
+        raise typer.Exit(1) from e
+    if not models:
+        note("aucun modèle dans Ollama")
+        return
+    current = settings.backends.ollama.model
+    for m in models:
+        mark = " (défaut dhaos)" if m == current or m.split(":")[0] == current else ""
+        console.print(f"- {escape(m)}{mark}", highlight=False)
+
+
+@model_app.command("show")
+def model_show(ctx: typer.Context, name: str | None = typer.Argument(None, help="Défaut : modèle configuré.")) -> None:
+    """Détail d'un modèle (base, paramètres, identité)."""
+    from ..backends.base import BackendError
+
+    settings, backend = _ollama_backend(ctx)
+    name = name or settings.backends.ollama.model
+    try:
+        info = backend.show_model(name)
+    except BackendError as e:
+        fail(str(e))
+        raise typer.Exit(1) from e
+    details = info.get("details") if isinstance(info.get("details"), dict) else {}
+    console.print(f"[bold]{escape(name)}[/]", highlight=False)
+    for key in ("family", "parameter_size", "quantization_level"):
+        if details.get(key):
+            console.print(f"  {key} : {escape(str(details[key]))}", highlight=False)
+    if info.get("parameters"):
+        console.print("  paramètres :", highlight=False)
+        for line in str(info["parameters"]).splitlines():
+            console.print(f"    {escape(line)}", highlight=False)
+    if info.get("system"):
+        console.print(f"  système : {escape(str(info['system'])[:200])}", highlight=False)
+
+
+@model_app.command("remove")
+def model_remove(ctx: typer.Context, name: str = typer.Argument(..., help="Modèle à supprimer d'Ollama.")) -> None:
+    """Supprimer un modèle d'Ollama."""
+    from ..backends.base import BackendError
+
+    _, backend = _ollama_backend(ctx)
+    try:
+        backend.delete_model(name)
+    except BackendError as e:
+        fail(str(e))
+        raise typer.Exit(1) from e
+    success(f"modèle supprimé : {name}")
+
+
+def _write_config_keys(settings: Settings, values: dict[str, Any]) -> Path:
+    """Écrit plusieurs clés dans le fichier de configuration (même méthode que
+    `config set` : contenu du fichier + clés, jamais les surcharges d'environnement)."""
+    path = _config_path(settings)
+    stored: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    for key, value in values.items():
+        _put_key(stored, key, value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(tomli_w.dumps(stored), encoding="utf-8")
+    for key, value in values.items():
+        target: Any = settings
+        parts = key.split(".")
+        for part in parts[:-1]:
+            target = getattr(target, part)
+        setattr(target, parts[-1], value)
+    return path
 
 
 # ========================================================================== ui

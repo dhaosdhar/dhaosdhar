@@ -947,3 +947,51 @@ def test_ui_refuses_server_with_other_token(invoke: Invoke, monkeypatch: pytest.
     monkeypatch.setattr(cli, "_token_accepted", lambda host, port, token, timeout=3.0: False)
     r = invoke("ui", "--no-browser")
     assert r.exit_code == 1 and "autre jeton" in r.output
+
+
+# ========================================================================= model
+class _FakeOllama:
+    def __init__(self, models: list[str]) -> None:
+        self.models = models
+        self.created: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
+
+    def list_models(self) -> list[str]:
+        return list(self.models)
+
+    def create_model(self, name: str, base: str, *, system: str = "", parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.created.append({"name": name, "base": base, "system": system, "parameters": parameters or {}})
+        self.models.append(f"{name}:latest")
+        return {"status": "success"}
+
+    def show_model(self, name: str) -> dict[str, Any]:
+        return {"details": {"family": "qwen2", "parameter_size": "7.6B"}, "parameters": "num_ctx 16384", "system": "Tu es dhaos"}
+
+    def delete_model(self, name: str) -> None:
+        self.deleted.append(name)
+
+
+def test_model_create_sets_default(invoke: Invoke, cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dhaos.cli import main as cli
+
+    fake = _FakeOllama(["qwen2.5-coder:7b"])
+    monkeypatch.setattr(cli, "_ollama_backend", lambda ctx: (cli._settings(ctx), fake))
+    r = invoke("model", "create")
+    assert r.exit_code == 0, r.output
+    assert fake.created[0]["base"] == "qwen2.5-coder:7b" and fake.created[0]["name"] == "dhaos"
+    assert "Tu es dhaos" in fake.created[0]["system"] and fake.created[0]["parameters"]["num_ctx"] == 16384
+    stored = _read_cfg(cfg)
+    assert stored["backends"]["ollama"]["model"] == "dhaos" and stored["backends"]["ollama"]["base_model"] == "qwen2.5-coder:7b"
+    r = invoke("model", "list")
+    assert r.exit_code == 0 and "dhaos:latest (défaut dhaos)" in r.output
+    assert invoke("model", "show").exit_code == 0
+    assert invoke("model", "remove", "dhaos").exit_code == 0 and fake.deleted == ["dhaos"]
+
+
+def test_model_create_requires_base(invoke: Invoke, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dhaos.cli import main as cli
+
+    fake = _FakeOllama([])
+    monkeypatch.setattr(cli, "_ollama_backend", lambda ctx: (cli._settings(ctx), fake))
+    r = invoke("model", "create", "--base", "qwen2.5-coder:3b")
+    assert r.exit_code == 1 and "ollama pull qwen2.5-coder:3b" in r.output and not fake.created

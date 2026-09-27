@@ -335,7 +335,7 @@ def test_embed_404(settings: Settings) -> None:
         return httpx.Response(404, json={"error": "not found"})
 
     backend, _ = make_backend(settings, handler)
-    with pytest.raises(BackendError, match="ollama pull"):
+    with pytest.raises(BackendError, match="dhaos model create"):  # modèle par défaut « dhaos » : se crée, ne se télécharge pas
         backend.embed(["a"])
 
 
@@ -363,7 +363,7 @@ def test_healthcheck_model_absent(settings: Settings) -> None:
     backend, _ = make_backend(settings, tags("llama3:latest"))
     hc = backend.healthcheck()
     assert hc["ok"] is False
-    assert f"ollama pull {settings.backends.ollama.model}" in hc["detail"]
+    assert "dhaos model create" in hc["detail"] and settings.backends.ollama.base_model in hc["detail"]
     assert hc["models"] == ["llama3:latest"]
 
 
@@ -658,3 +658,75 @@ def test_rescue_flattened_arguments_next_to_name() -> None:
     # avec un simple ensemble de noms, rien n'est deviné
     rest, calls = rescue_text_tool_calls('{"name": "kb_search", "query": "x"}', {"kb_search"})
     assert calls == [{"name": "kb_search", "arguments": {}}]
+
+
+# --------------------------------------------------------------------------
+# Schémas compacts et gestion des modèles
+# --------------------------------------------------------------------------
+from dhaos.backends.ollama import compact_schema, missing_model_hint  # noqa: E402
+
+
+def test_compact_schema_keeps_structure_drops_descriptions() -> None:
+    full = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "description": "Chemin du fichier"},
+            "depth": {"type": "integer", "minimum": 1, "maximum": 3, "description": "Profondeur", "default": 1},
+            "bases": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 32},
+            "mode": {"type": "string", "enum": ["a", "b"]},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    c = compact_schema(full)
+    assert c["required"] == ["path"] and "additionalProperties" not in c
+    assert c["properties"]["path"] == {"type": "string"}
+    assert c["properties"]["depth"] == {"type": "integer", "default": 1}
+    assert c["properties"]["bases"] == {"type": "array", "items": {"type": "string"}}
+    assert c["properties"]["mode"] == {"type": "string", "enum": ["a", "b"]}
+    assert len(json.dumps(c)) < len(json.dumps(full)) * 0.7
+
+
+def test_chat_sends_compact_schemas(settings: Settings) -> None:
+    backend, seen = make_backend(settings, chat_stream({"message": {"role": "assistant", "content": "ok"}, "done": False}, done_chunk()))
+    backend.chat([Message(role="user", content="x")], tools=[TOOL])
+    params = json.loads(seen[0].content)["tools"][0]["function"]["parameters"]
+    assert params == {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+
+def test_missing_model_hint() -> None:
+    assert "dhaos model create" in missing_model_hint("dhaos", "qwen2.5-coder:7b")
+    assert missing_model_hint("qwen2.5-coder:3b") == "modèle absent : ollama pull qwen2.5-coder:3b"
+
+
+def test_model_management_endpoints(settings: Settings) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen2.5-coder:7b"}, {"name": "dhaos:latest"}]})
+        if request.url.path == "/api/create":
+            return httpx.Response(200, json={"status": "success"})
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"details": {"family": "qwen2"}, "parameters": "num_ctx 8192", "system": "Tu es dhaos"})
+        if request.url.path == "/api/delete":
+            return httpx.Response(200, json={})
+        return httpx.Response(404, text="?")
+
+    backend, _ = make_backend(settings, handler)
+    assert backend.list_models() == ["qwen2.5-coder:7b", "dhaos:latest"]
+    result = backend.create_model("dhaos", "qwen2.5-coder:7b", system="Tu es dhaos", parameters={"num_ctx": 8192})
+    assert result == {"status": "success"}
+    assert calls[-1] == ("POST", "/api/create", {"model": "dhaos", "from": "qwen2.5-coder:7b", "stream": False, "system": "Tu es dhaos", "parameters": {"num_ctx": 8192}})
+    assert backend.show_model("dhaos")["details"]["family"] == "qwen2"
+    backend.delete_model("dhaos")
+    assert calls[-1] == ("DELETE", "/api/delete", {"model": "dhaos"})
+
+
+def test_default_model_is_dhaos_with_base(settings: Settings) -> None:
+    assert settings.backends.ollama.model == "dhaos" and settings.backends.ollama.base_model == "qwen2.5-coder:7b"
+    backend, _ = make_backend(settings, lambda r: httpx.Response(200, json={"models": [{"name": "qwen2.5-coder:7b"}]}))
+    h = backend.healthcheck()
+    assert h["ok"] is False and "dhaos model create" in h["detail"]

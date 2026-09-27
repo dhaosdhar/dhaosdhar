@@ -134,7 +134,10 @@ class PathsConfig(BaseModel):
 
 class OllamaConfig(BaseModel):
     host: str = "http://127.0.0.1:11434"
-    model: str = "qwen2.5-coder:7b"
+    # « dhaos » : modèle Ollama créé par `dhaos model create` à partir de base_model
+    # (poids du modèle de base + identité dhaos + paramètres).
+    model: str = "dhaos"
+    base_model: str = "qwen2.5-coder:7b"
     embed_model: str = "nomic-embed-text"
     timeout: float = 300.0
     num_ctx: int | None = 16384  # fenêtre de contexte demandée (options.num_ctx)

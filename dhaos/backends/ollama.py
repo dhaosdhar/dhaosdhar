@@ -45,6 +45,13 @@ def _error_detail(err: Any) -> str:
         return str(err)
 
 
+def missing_model_hint(model: str, base: str = "") -> str:
+    """Conseil quand le modèle configuré est absent d'Ollama."""
+    if model.split(":")[0] == "dhaos":
+        return f"modèle {model} absent : lancez `dhaos model create` (base : {base or 'backends.ollama.base_model'})"
+    return f"modèle absent : ollama pull {model}"
+
+
 def _strip_latest(name: str) -> str:
     return name[: -len(":latest")] if name.endswith(":latest") else name
 
@@ -188,6 +195,30 @@ def rescue_text_tool_calls(
     return "".join(pieces).strip(), calls
 
 
+_SCHEMA_KEEP_KEYS = ("type", "properties", "required", "items", "enum", "default")
+
+
+def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Schéma allégé pour les modèles locaux : noms, types, requis, énumérations ;
+    ni descriptions de propriétés ni bornes (minLength, maximum…). Les schémas
+    complets pèsent ~2 000 tokens relus à chaque premier tour sur CPU ; les
+    entrées restent validées côté registre avec le schéma complet."""
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {}
+    for key in _SCHEMA_KEEP_KEYS:
+        if key not in schema:
+            continue
+        value = schema[key]
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {name: compact_schema(spec) if isinstance(spec, dict) else spec for name, spec in value.items()}
+        elif key == "items" and isinstance(value, dict):
+            out[key] = compact_schema(value)
+        else:
+            out[key] = value
+    return out
+
+
 class _TextGate:
     """Diffuse le texte au fil de l'eau, mais retient la fin de la réponse dès
     qu'elle ressemble à un appel d'outil écrit en clair : ``{`` ou ``[`` en
@@ -293,9 +324,56 @@ class OllamaBackend(Backend):
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.parameters,
+                "parameters": compact_schema(tool.parameters),
             },
         }
+
+    # ------------------------------------------------------- gestion des modèles
+    def list_models(self) -> list[str]:
+        data = self._get_json("/api/tags")
+        models = data.get("models") if isinstance(data, dict) else None
+        return [str(m.get("name")) for m in (models or []) if isinstance(m, dict) and m.get("name")]
+
+    def show_model(self, name: str) -> dict[str, Any]:
+        data = self._post_json("/api/show", {"model": name})
+        return data if isinstance(data, dict) else {}
+
+    def create_model(
+        self,
+        name: str,
+        base: str,
+        *,
+        system: str = "",
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Crée un modèle Ollama dérivé de ``base`` (``POST /api/create``)."""
+        payload: dict[str, Any] = {"model": name, "from": base, "stream": False}
+        if system:
+            payload["system"] = system
+        if parameters:
+            payload["parameters"] = parameters
+        data = self._post_json("/api/create", payload)
+        return data if isinstance(data, dict) else {"status": str(data)}
+
+    def delete_model(self, name: str) -> None:
+        try:
+            resp = self._client.request("DELETE", self.host + "/api/delete", json={"model": name}, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        if resp.status_code >= 400:
+            raise self._status_error(resp.status_code, resp.text)
+
+    def _get_json(self, path: str) -> Any:
+        try:
+            resp = self._client.get(self.host + path, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        if resp.status_code >= 400:
+            raise self._status_error(resp.status_code, resp.text)
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise BackendError(f"réponse invalide d'Ollama sur {path}") from exc
 
     @staticmethod
     def to_ollama_messages(messages: list[Message], system: str = "") -> list[dict[str, Any]]:
@@ -337,7 +415,7 @@ class OllamaBackend(Backend):
 
     def _status_error(self, status: int, body: str) -> BackendError:
         if status == 404:
-            return BackendError(f"modèle absent : ollama pull {self.model}")
+            return BackendError(missing_model_hint(self.model, self.cfg.base_model))
         detail = body.strip()
         try:
             parsed = json.loads(detail)
@@ -547,8 +625,7 @@ class OllamaBackend(Backend):
             result["detail"] = f"Ollama joignable sur {self.host} ; modèle {self.model} présent"
         else:
             result["detail"] = (
-                f"Ollama joignable sur {self.host} mais le modèle {self.model} est absent : "
-                f"ollama pull {self.model}"
+                f"Ollama joignable sur {self.host} mais le {missing_model_hint(self.model, self.cfg.base_model)}"
             )
         return result
 

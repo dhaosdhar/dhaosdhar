@@ -104,3 +104,24 @@ def test_prompt_is_deterministic(settings: Settings, project_root: Path) -> None
     b = _build(settings, project_root, bases=bases, extra="e")
     assert a == b
     assert "2026" not in a  # aucun horodatage
+
+
+def test_prompt_states_real_capabilities(settings):
+    """Le prompt dit explicitement ce que l'agent peut faire (disque entier,
+    Internet…) : sinon un modèle local répond « je n'ai pas accès au disque »."""
+    from pathlib import Path
+
+    from dhaos.agent.prompts import build_system_prompt
+
+    names = ["read_file", "list_dir", "find_files", "grep", "write_file", "edit_file", "run_command", "web_search", "fetch_url", "kb_search"]
+    text = build_system_prompt(settings, project_root=Path("/p"), bases=[], backend_name="ollama", tool_names=names)
+    assert "# Tes capacités réelles" in text
+    assert "ensemble du disque" in text and "chemins absolus" in text
+    assert "Internet" in text and "web_search" in text
+    assert "Ne dis jamais que tu n'as pas accès" in text
+    settings.tools.read_roots = [Path("/home/x/projets")]
+    settings.tools.shell_policy = "deny"
+    text = build_system_prompt(settings, project_root=Path("/p"), bases=[], backend_name="ollama", tool_names=names)
+    assert "/home/x/projets" in text and "run_command" not in text.split("# Tes capacités réelles")[1].split("# Règles")[0]
+    text = build_system_prompt(settings, project_root=Path("/p"), bases=[], backend_name="ollama", tool_names=[])
+    assert "# Tes capacités réelles" not in text
