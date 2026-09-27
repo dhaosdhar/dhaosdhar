@@ -69,7 +69,8 @@ $DH backends
 cat <<MSG
 
 Prêt. Pour utiliser dhaos :
-  dhaos ui                                    # interface web dans le navigateur (lance le serveur si besoin)
+  dhaos gui                                   # interface de bureau (aussi dans le menu des applications)
+  dhaos ui                                    # interface web dans le navigateur
   dhaos chat                                  # en ligne de commande
   systemctl --user enable --now dhaos-api     # service permanent : http://127.0.0.1:8642/
 Configuration : $CFG

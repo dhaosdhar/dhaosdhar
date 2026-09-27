@@ -18,7 +18,7 @@ case "$1" in
 
 dhaos est installé.
   1. En tant qu'utilisateur (pas root) : dhaos-setup      # installe Ollama et télécharge les modèles
-  2. Puis : dhaos ui                                       # lance l'interface web dans le navigateur
+  2. Puis : dhaos gui                                      # interface de bureau (ou « dhaos » dans le menu des applications)
      ou : systemctl --user enable --now dhaos-api          # service permanent, interface sur http://127.0.0.1:8642/
 MSG
     ;;

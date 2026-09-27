@@ -310,6 +310,34 @@ def _nested_set(d: dict[str, Any], dotted: str, value: Any) -> None:
     node[parts[-1]] = value
 
 
+def write_config_keys(settings: "Settings", values: dict[str, Any], path: Path | None = None) -> Path:
+    """Écrit des clés ``section.cle`` dans le fichier de configuration et les
+    applique à l'objet ``settings`` en place.
+
+    Seul le contenu du fichier (plus les clés données) est réécrit : les
+    surcharges d'environnement et les chemins calculés ne sont jamais figés.
+    Les valeurs sont validées par le modèle avant écriture.
+    """
+    target_path = Path(path) if path else (settings.source_path or default_config_path())
+    stored: dict[str, Any] = {}
+    if target_path.is_file():
+        stored = tomllib.loads(target_path.read_text(encoding="utf-8"))
+    for key, value in values.items():
+        _nested_set(stored, key, value)
+    validated = Settings.model_validate(stored)  # lève ValidationError si une valeur est invalide
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(tomli_w.dumps(stored), encoding="utf-8")
+    for key in values:
+        parts = key.split(".")
+        src: Any = validated
+        dst: Any = settings
+        for part in parts[:-1]:
+            src = getattr(src, part)
+            dst = getattr(dst, part)
+        setattr(dst, parts[-1], getattr(src, parts[-1]))
+    return target_path
+
+
 class Settings(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     backends: BackendsConfig = Field(default_factory=BackendsConfig)

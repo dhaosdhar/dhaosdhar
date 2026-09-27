@@ -24,7 +24,7 @@ from rich.markup import escape
 
 from .. import __version__
 from ..backends import BACKEND_NAMES, get_backend
-from ..config import ENV_PREFIX, Settings, default_config_path, env_overrides
+from ..config import ENV_PREFIX, Settings, default_config_path, env_overrides, write_config_keys
 from ..policy import Confirmer, Journal, auto_confirm
 from ..runtime import build_runtime
 from ..types import ToolCall
@@ -1230,21 +1230,21 @@ def model_remove(ctx: typer.Context, name: str = typer.Argument(..., help="Modè
 
 
 def _write_config_keys(settings: Settings, values: dict[str, Any]) -> Path:
-    """Écrit plusieurs clés dans le fichier de configuration (même méthode que
-    `config set` : contenu du fichier + clés, jamais les surcharges d'environnement)."""
-    path = _config_path(settings)
-    stored: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    for key, value in values.items():
-        _put_key(stored, key, value)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tomli_w.dumps(stored), encoding="utf-8")
-    for key, value in values.items():
-        target: Any = settings
-        parts = key.split(".")
-        for part in parts[:-1]:
-            target = getattr(target, part)
-        setattr(target, parts[-1], value)
-    return path
+    """Voir ``dhaos.config.write_config_keys`` (fichier de la CLI : ``--config``)."""
+    return write_config_keys(settings, values, _config_path(settings))
+
+
+# ========================================================================= gui
+@app.command("gui")
+def gui_cmd(ctx: typer.Context) -> None:
+    """Interface de bureau (Tkinter) : conversations simultanées, bases de savoir, journal, réglages."""
+    settings = _settings(ctx)
+    try:
+        from ..gui.app import run_app
+    except ImportError as e:  # tkinter absent de cette installation de Python
+        fail(f"interface de bureau indisponible ({e}) — installez python3-tk : sudo apt install python3-tk")
+        raise typer.Exit(1) from e
+    run_app(settings)
 
 
 # ========================================================================== ui
