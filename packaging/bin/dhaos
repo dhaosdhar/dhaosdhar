@@ -1,0 +1,7 @@
+#!/bin/sh
+# Lanceur système : délègue à l'environnement Python de dhaos.
+if [ ! -x /opt/dhaos/venv/bin/dhaos ]; then
+  echo "dhaos : environnement absent ; lancez : sudo /opt/dhaos/install-venv.sh" >&2
+  exit 1
+fi
+exec /opt/dhaos/venv/bin/dhaos "$@"

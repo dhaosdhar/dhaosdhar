@@ -1,0 +1,14 @@
+# Unité utilisateur : systemctl --user enable --now dhaos-api
+[Unit]
+Description=dhaos — API HTTP et interface web de l'assistant de codage
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/dhaos/venv/bin/dhaos serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -35,6 +35,28 @@ pip install -e '.[train]'        # + torch (modèle nano)
 pip install -e '.[finetune]'     # + torch, transformers, peft, datasets, accelerate (LoRA)
 ```
 
+### Installation par paquet .deb (Ubuntu / Debian)
+
+Le paquet installe l'application dans `/opt/dhaos` (environnement Python isolé), les commandes
+`dhaos` et `dhaos-setup`, un lanceur de bureau « dhaos » et deux unités systemd. Les modèles
+(plusieurs Go) ne sont pas dans le paquet : `dhaos-setup` les télécharge.
+
+```sh
+sudo apt install ./dhaos_0.1.0_all.deb     # dépendances : python3 ≥ 3.11, python3-venv, python3-pip, curl
+dhaos-setup                                 # en tant qu'utilisateur : Ollama + modèles (choisis selon la RAM) + configuration
+dhaos ui                                    # ouvre l'interface web (lance le serveur en arrière-plan si besoin)
+```
+
+`dhaos-setup --model qwen2.5-coder:7b` force un modèle ; `--skip-ollama` pour n'utiliser que Claude.
+Service permanent : `systemctl --user enable --now dhaos-api` (ou, pour un compte donné,
+`sudo systemctl enable --now dhaos-api@utilisateur`). Le lanceur de bureau exécute `dhaos ui`,
+qui enregistre un jeton stable dans la configuration (`api.token`) la première fois.
+
+Construire le paquet depuis les sources : `packaging/build-deb.sh` (paquet `all` léger, dépendances
+depuis PyPI à l'installation) ou `packaging/build-deb.sh --offline 3.14` (roues embarquées pour
+Python 3.14 x86_64, installable sans réseau). Le script vérifie le paquet ré-extrait (`md5sums`,
+scripts, présence de l'interface).
+
 **Ollama** (cerveau local, recommandé pour démarrer) :
 
 ```sh
@@ -253,6 +275,7 @@ utilisable hors ligne, thème clair/sombre.
 
 ```sh
 dhaos serve --open          # lance l'API et ouvre l'interface dans le navigateur
+dhaos ui                    # même chose, mais le serveur reste en arrière-plan et le jeton est enregistré (lanceur de bureau)
 ```
 
 Au démarrage, `dhaos serve` affiche l'URL de l'interface **avec le jeton** (`/?token=…`) : la page le

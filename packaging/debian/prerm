@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+case "$1" in
+  remove)
+    if command -v systemctl >/dev/null 2>&1; then
+      for unit in $(systemctl list-units --type=service --all --no-legend 'dhaos-api@*' 2>/dev/null | awk '{print $1}'); do
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+      done
+    fi
+    ;;
+esac
+exit 0

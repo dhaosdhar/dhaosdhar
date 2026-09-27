@@ -1,0 +1,75 @@
+#!/bin/bash
+# dhaos-setup : installe Ollama si nécessaire, télécharge les modèles et
+# prépare la configuration de l'utilisateur courant. À lancer comme
+# utilisateur normal (la configuration vit dans ~/.config/dhaos).
+#
+#   dhaos-setup [--model NOM] [--embed NOM] [--yes] [--skip-ollama]
+set -e
+MODEL=""; EMBED="nomic-embed-text"; YES=0; SKIP_OLLAMA=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2 ;;
+    --embed) EMBED="$2"; shift 2 ;;
+    --yes|-y) YES=1; shift ;;
+    --skip-ollama) SKIP_OLLAMA=1; shift ;;
+    -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "option inconnue : $1" >&2; exit 2 ;;
+  esac
+done
+if [ "$(id -u)" = "0" ]; then
+  echo "dhaos-setup : lancez ce script comme utilisateur normal (pas root) ; il demandera sudo si besoin." >&2
+  exit 1
+fi
+ask() { [ "$YES" = 1 ] && return 0; read -r -p "$1 [O/n] " r; [ -z "$r" ] || [ "$r" = "o" ] || [ "$r" = "O" ] || [ "$r" = "y" ]; }
+
+# --- Ollama
+if [ "$SKIP_OLLAMA" = 0 ]; then
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "Ollama n'est pas installé (exécution locale des modèles)."
+    if ask "Installer Ollama maintenant (curl https://ollama.com/install.sh | sh, via sudo) ?"; then
+      curl -fsSL https://ollama.com/install.sh | sh
+    else
+      echo "Sans Ollama, seul le backend Claude (clé API) est utilisable : dhaos config set backends.default claude"
+      exit 0
+    fi
+  fi
+  if ! curl -fs http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    sudo systemctl start ollama 2>/dev/null || (nohup ollama serve >/dev/null 2>&1 &)
+    for _ in $(seq 1 30); do curl -fs http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+  fi
+  if ! curl -fs http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    echo "Ollama ne répond pas sur http://127.0.0.1:11434 ; vérifiez : systemctl status ollama" >&2
+    exit 1
+  fi
+  # --- choix du modèle selon la mémoire disponible (un 7B a besoin de ~6 Go libres)
+  TOTAL_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+  AVAIL_MB=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)
+  if [ -z "$MODEL" ]; then
+    if [ "$AVAIL_MB" -ge 9000 ]; then MODEL="qwen2.5-coder:7b"; else MODEL="qwen2.5-coder:3b"; fi
+    echo "Mémoire : ${TOTAL_MB} Mo au total, ${AVAIL_MB} Mo disponibles → modèle proposé : $MODEL"
+  fi
+  echo "Téléchargement des modèles (une seule fois) : $MODEL et $EMBED"
+  ollama pull "$MODEL"
+  ollama pull "$EMBED"
+fi
+
+# --- configuration utilisateur
+DH=${DHAOS_BIN:-dhaos}
+CFG=$($DH config path)
+[ -f "$CFG" ] || $DH config init >/dev/null
+if [ -n "$MODEL" ]; then
+  $DH config set backends.ollama.model "$MODEL" >/dev/null
+  $DH config set backends.ollama.embed_model "$EMBED" >/dev/null
+  $DH config set backends.ollama.keep_alive 30m >/dev/null
+  if [ "${TOTAL_MB:-0}" -gt 0 ] && [ "$TOTAL_MB" -lt 16000 ]; then $DH config set backends.ollama.num_ctx 8192 >/dev/null; fi
+fi
+echo
+$DH backends
+cat <<MSG
+
+Prêt. Pour utiliser dhaos :
+  dhaos ui                                    # interface web dans le navigateur (lance le serveur si besoin)
+  dhaos chat                                  # en ligne de commande
+  systemctl --user enable --now dhaos-api     # service permanent : http://127.0.0.1:8642/
+Configuration : $CFG
+MSG

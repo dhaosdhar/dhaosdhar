@@ -1,0 +1,14 @@
+# Dépendances épinglées pour le paquet .deb (versions validées avec la suite de tests).
+anthropic==1.8.0
+httpx==0.28.1
+typer==0.27.2
+rich==15.0.0
+pydantic==2.13.5
+fastapi==0.141.1
+uvicorn==0.54.0
+numpy>=2.0
+beautifulsoup4==4.15.0
+ddgs==9.16.0
+jsonschema==4.26.0
+pypdf==6.19.0
+tomli-w==1.2.0

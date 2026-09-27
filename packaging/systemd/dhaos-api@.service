@@ -1,0 +1,19 @@
+# Unité système par utilisateur : sudo systemctl enable --now dhaos-api@<utilisateur>
+[Unit]
+Description=dhaos — API HTTP et interface web (utilisateur %i)
+After=network-online.target ollama.service
+
+[Service]
+Type=simple
+User=%i
+Environment=HOME=/home/%i
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/%i
+ExecStart=/opt/dhaos/venv/bin/dhaos serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

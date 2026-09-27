@@ -1,0 +1,14 @@
+Package: dhaos
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.11), python3-venv, python3-pip, curl, ca-certificates
+Maintainer: dhaosdhar <jean-samuel.crottet@univ-grenoble-alpes.fr>
+Homepage: https://github.com/dhaosdhar/dhaosdhar
+Description: Assistant de codage agentique avec bases de savoir locales
+ Cerveau commutable (Ollama en local ou Claude via API), accès au disque et
+ au shell sous politique d'accès, recherche web, bases de savoir SQLite par
+ catégorie, CLI, API HTTP et interface web. Le paquet installe l'application
+ dans /opt/dhaos ; les modèles Ollama se téléchargent avec `dhaos-setup`.

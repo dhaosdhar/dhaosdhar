@@ -185,6 +185,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 /* -------------------------------------------------------------- config */
 .config-layout { display: grid; grid-template-columns: 420px 1fr; gap: 20px; align-items: start; }
 #config-form .field { justify-content: space-between; }
+#config-form .field.checkbox { justify-content: flex-start; }
+#config-form .field.checkbox span { white-space: normal; }
 #config-form .field input, #config-form .field select { min-width: 200px; }
 
 /* -------------------------------------------------------------- modal */

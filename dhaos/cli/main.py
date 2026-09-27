@@ -1121,6 +1121,101 @@ def train_lora(
     success(f"Adaptateur LoRA enregistré dans {path}")
 
 
+# ========================================================================== ui
+def _api_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
+    """``True`` si ``/health`` répond (sans jeton : état minimal, mais 200)."""
+    import httpx
+
+    try:
+        return httpx.get(f"http://{host}:{port}/health", timeout=timeout).status_code == 200
+    except Exception:  # noqa: BLE001 — injoignable, refus, délai
+        return False
+
+
+def _token_accepted(host: str, port: int, token: str, timeout: float = 3.0) -> bool:
+    """``True`` si le serveur en place accepte ce jeton (``GET /config``)."""
+    import httpx
+
+    try:
+        r = httpx.get(f"http://{host}:{port}/config", headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        return r.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ensure_persistent_token(settings: Settings) -> str:
+    """Jeton stable enregistré dans le fichier de configuration : un serveur
+    lancé en arrière-plan n'aurait sinon qu'un jeton éphémère inconnu du
+    navigateur. Le fichier est réécrit comme par ``config set`` (contenu du
+    fichier + la clé, jamais les surcharges d'environnement)."""
+    if settings.api.token:
+        return settings.api.token
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    path = _config_path(settings)
+    stored: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    _put_key(stored, "api.token", token)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(tomli_w.dumps(stored), encoding="utf-8")
+    settings.api.token = token
+    note(f"jeton d'accès généré et enregistré dans {path} (api.token)")
+    return token
+
+
+@app.command("ui")
+def ui_cmd(
+    ctx: typer.Context,
+    host: str | None = typer.Option(None, "--host", help="Adresse du serveur (défaut : api.host)."),
+    port: int | None = typer.Option(None, "--port", min=1, max=65535, help="Port (défaut : api.port)."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Ne pas ouvrir le navigateur, afficher l'URL."),
+    wait: float = typer.Option(20.0, "--wait", min=1.0, help="Attente maximale du démarrage (s)."),
+) -> None:
+    """Ouvrir l'interface web ; lance le serveur en arrière-plan s'il ne tourne pas.
+
+    C'est la commande du lanceur de bureau. Le serveur démarré ici survit à
+    la fermeture du terminal (journal dans le dossier de données).
+    """
+    import subprocess
+    import time
+    import webbrowser
+
+    settings = _settings(ctx)
+    host = host or settings.api.host
+    port = port or settings.api.port
+    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    token = _ensure_persistent_token(settings)
+    url = f"http://{browse_host}:{port}/?token={token}"
+
+    if _api_reachable(browse_host, port):
+        if not _token_accepted(browse_host, port, token):
+            fail(
+                f"un serveur répond déjà sur http://{browse_host}:{port} avec un autre jeton "
+                "(lancé à la main ?) : utilisez l'URL affichée par `dhaos serve`, ou arrêtez-le et relancez `dhaos ui`."
+            )
+            raise typer.Exit(1)
+        note(f"serveur déjà en place sur http://{browse_host}:{port}")
+    else:
+        settings.ensure_dirs()
+        log_path = settings.data_dir / "serve.log"
+        cmd = [sys.executable, "-m", "dhaos.cli"]
+        if settings.source_path:
+            cmd += ["--config", str(settings.source_path)]
+        cmd += ["serve", "--host", host, "--port", str(port)]
+        with open(log_path, "ab") as log:
+            subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        note(f"serveur lancé en arrière-plan (journal : {log_path})")
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and not _api_reachable(browse_host, port):
+            time.sleep(0.3)
+        if not _api_reachable(browse_host, port):
+            fail(f"le serveur ne répond pas après {wait:g} s ; voir {log_path}")
+            raise typer.Exit(1)
+    success(f"interface web : {url}")
+    if not no_browser:
+        webbrowser.open(url)
+
+
 # ===================================================================== version
 @app.command()
 def version() -> None:

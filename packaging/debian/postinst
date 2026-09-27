@@ -1,0 +1,26 @@
+#!/bin/bash
+# postinst dhaos : environnement Python isolé dans /opt/dhaos/venv.
+set -e
+case "$1" in
+  configure)
+    if ! /opt/dhaos/install-venv.sh; then
+      echo "dhaos : l'installation de l'environnement Python a échoué." >&2
+      echo "        Vérifiez l'accès réseau (PyPI) puis relancez : sudo /opt/dhaos/install-venv.sh" >&2
+      exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    cat <<'MSG'
+
+dhaos est installé.
+  1. En tant qu'utilisateur (pas root) : dhaos-setup      # installe Ollama et télécharge les modèles
+  2. Puis : dhaos ui                                       # lance l'interface web dans le navigateur
+     ou : systemctl --user enable --now dhaos-api          # service permanent, interface sur http://127.0.0.1:8642/
+MSG
+    ;;
+esac
+exit 0

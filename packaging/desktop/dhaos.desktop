@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dhaos
+GenericName=Assistant de codage
+Comment=Assistant de codage agentique avec bases de savoir locales
+Exec=/usr/bin/dhaos ui
+Icon=dhaos
+Terminal=false
+Categories=Development;Utility;
+Keywords=IA;LLM;code;assistant;ollama;
+StartupNotify=false

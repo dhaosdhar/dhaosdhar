@@ -890,3 +890,60 @@ def test_train_lora_user_errors_are_clean(invoke: Invoke, monkeypatch: pytest.Mo
     result = invoke("train", "lora", str(dataset))
     _assert_clean_failure(result, "indisponible : x")
     assert not isinstance(result.exception, RuntimeError)
+
+
+# ============================================================================ ui
+def _read_cfg(cfg: Path) -> dict[str, Any]:
+    import tomllib
+
+    return tomllib.loads(cfg.read_text(encoding="utf-8"))
+
+
+def test_ui_generates_token_and_opens_browser(invoke: Invoke, cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serveur déjà en place et jeton accepté : le jeton est enregistré dans la
+    configuration et le navigateur reçoit l'URL avec ce jeton."""
+    import webbrowser
+
+    from dhaos.cli import main as cli
+
+    opened: list[str] = []
+    monkeypatch.setattr(cli, "_api_reachable", lambda host, port, timeout=1.5: True)
+    monkeypatch.setattr(cli, "_token_accepted", lambda host, port, token, timeout=3.0: True)
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
+    assert "token" not in _read_cfg(cfg).get("api", {})
+    r = invoke("ui")
+    assert r.exit_code == 0, r.output
+    token = _read_cfg(cfg)["api"]["token"]
+    assert len(token) > 20 and opened == [f"http://127.0.0.1:8642/?token={token}"]
+    assert "serveur déjà en place" in r.output
+    # second appel : même jeton, pas de régénération
+    invoke("ui")
+    assert _read_cfg(cfg)["api"]["token"] == token and opened[-1].endswith(token)
+
+
+def test_ui_starts_server_when_down(invoke: Invoke, cfg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from dhaos.cli import main as cli
+
+    calls = iter([False, True])
+    launched: list[list[str]] = []
+    monkeypatch.setattr(cli, "_api_reachable", lambda host, port, timeout=1.5: next(calls, True))
+    monkeypatch.setattr(cli, "_token_accepted", lambda host, port, token, timeout=3.0: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: launched.append(list(cmd)))
+    r = invoke("ui", "--no-browser", "--port", "8700")
+    assert r.exit_code == 0, r.output
+    assert len(launched) == 1
+    cmd = launched[0]
+    assert cmd[1:3] == ["-m", "dhaos.cli"] and "serve" in cmd and cmd[cmd.index("--port") + 1] == "8700"
+    assert cmd[cmd.index("--config") + 1] == str(cfg)
+    assert "lancé en arrière-plan" in r.output and "http://127.0.0.1:8700/?token=" in r.output
+
+
+def test_ui_refuses_server_with_other_token(invoke: Invoke, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dhaos.cli import main as cli
+
+    monkeypatch.setattr(cli, "_api_reachable", lambda host, port, timeout=1.5: True)
+    monkeypatch.setattr(cli, "_token_accepted", lambda host, port, token, timeout=3.0: False)
+    r = invoke("ui", "--no-browser")
+    assert r.exit_code == 1 and "autre jeton" in r.output
