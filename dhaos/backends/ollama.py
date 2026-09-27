@@ -14,7 +14,8 @@ import os
 import re
 import sys
 import uuid
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import httpx
 
@@ -43,6 +44,58 @@ def _error_detail(err: Any) -> str:
         return json.dumps(err, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(err)
+
+
+def parse_modelfile(text: str) -> dict[str, Any]:
+    """Lit un Modelfile Ollama : FROM, TEMPLATE, SYSTEM (blocs \"\"\"…\"\"\") et
+    PARAMETER (``stop`` répété → liste)."""
+    spec: dict[str, Any] = {"from": "", "template": "", "system": "", "parameters": {}}
+    lines = text.replace("\r\n", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i].strip()
+        i += 1
+        if not raw or raw.startswith("#"):
+            continue
+        keyword, _, rest = raw.partition(" ")
+        key = keyword.upper()
+        rest = rest.strip()
+        if key in ("TEMPLATE", "SYSTEM"):
+            if rest.startswith('"""'):
+                body = rest[3:]
+                if body.endswith('"""') and len(body) >= 3:
+                    value = body[:-3]
+                else:
+                    chunk = [body]
+                    while i < len(lines):
+                        line = lines[i]
+                        i += 1
+                        if line.rstrip().endswith('"""'):
+                            chunk.append(line.rstrip()[:-3])
+                            break
+                        chunk.append(line)
+                    value = "\n".join(chunk)
+            else:
+                value = rest.strip('"')
+            spec[key.lower()] = value
+        elif key == "FROM":
+            spec["from"] = rest
+        elif key == "PARAMETER":
+            name, _, value = rest.partition(" ")
+            value = value.strip()
+            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                parsed: Any = value[1:-1]
+            else:
+                try:
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = value
+            params = spec["parameters"]
+            if name == "stop":
+                params.setdefault("stop", []).append(parsed)
+            else:
+                params[name] = parsed
+    return spec
 
 
 def missing_model_hint(model: str, base: str = "") -> str:
@@ -352,6 +405,62 @@ class OllamaBackend(Backend):
             payload["system"] = system
         if parameters:
             payload["parameters"] = parameters
+        data = self._post_json("/api/create", payload)
+        return data if isinstance(data, dict) else {"status": str(data)}
+
+    def blob_exists(self, digest: str) -> bool:
+        try:
+            resp = self._client.head(self.host + f"/api/blobs/sha256:{digest}", timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        return resp.status_code == 200
+
+    def upload_blob(self, digest: str, path: Path) -> None:
+        """Téléverse un fichier de poids dans le dépôt d'Ollama (``POST /api/blobs/sha256:…``)."""
+        try:
+            with open(path, "rb") as handle:
+                resp = self._client.post(
+                    self.host + f"/api/blobs/sha256:{digest}", content=handle, timeout=max(self.timeout, 3600.0)
+                )
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        if resp.status_code >= 400:
+            raise self._status_error(resp.status_code, resp.text)
+
+    def import_modelfile(
+        self, modelfile: Path, name: str = "dhaos", *, on_log: Callable[[str], None] | None = None
+    ) -> dict[str, Any]:
+        """Crée ``name`` à partir d'un Modelfile dont FROM désigne un fichier
+        GGUF : le blob est téléversé s'il manque, puis ``/api/create`` reçoit
+        gabarit, identité et paramètres (aucune dépendance à la CLI ollama)."""
+        from ..utils import sha256_file
+
+        log = on_log or (lambda _msg: None)
+        spec = parse_modelfile(Path(modelfile).read_text(encoding="utf-8"))
+        source = spec.get("from") or ""
+        if not source:
+            raise BackendError("Modelfile sans FROM")
+        weights = Path(source)
+        if not weights.is_absolute():
+            weights = Path(modelfile).parent / weights
+        if not weights.is_file():
+            raise BackendError(f"fichier de poids introuvable : {weights}")
+        size_gb = weights.stat().st_size / 1e9
+        log(f"empreinte des poids ({size_gb:.2f} Go)…")
+        digest = sha256_file(weights)
+        if self.blob_exists(digest):
+            log("poids déjà présents dans Ollama")
+        else:
+            log(f"téléversement des poids vers Ollama ({size_gb:.2f} Go)…")
+            self.upload_blob(digest, weights)
+        payload: dict[str, Any] = {"model": name, "files": {weights.name: f"sha256:{digest}"}, "stream": False}
+        if spec.get("template"):
+            payload["template"] = spec["template"]
+        if spec.get("system"):
+            payload["system"] = spec["system"]
+        if spec.get("parameters"):
+            payload["parameters"] = spec["parameters"]
+        log(f"création du modèle {name}…")
         data = self._post_json("/api/create", payload)
         return data if isinstance(data, dict) else {"status": str(data)}
 

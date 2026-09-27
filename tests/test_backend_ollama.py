@@ -730,3 +730,85 @@ def test_default_model_is_dhaos_with_base(settings: Settings) -> None:
     backend, _ = make_backend(settings, lambda r: httpx.Response(200, json={"models": [{"name": "qwen2.5-coder:7b"}]}))
     h = backend.healthcheck()
     assert h["ok"] is False and "dhaos model create" in h["detail"]
+
+
+# --------------------------------------------------------------------------
+# Import d'un modèle livré (Modelfile + GGUF) par l'API
+# --------------------------------------------------------------------------
+from pathlib import Path as _Path  # noqa: E402
+
+from dhaos.backends.ollama import parse_modelfile  # noqa: E402
+
+MODELFILE = '''# généré
+FROM /opt/dhaos/models/dhaos.gguf
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>{{ end }}
+{{ .Prompt }}"""
+PARAMETER stop <|im_end|>
+PARAMETER stop "<|endoftext|>"
+PARAMETER temperature 0.7
+PARAMETER num_ctx 8192
+SYSTEM """Tu es dhaos."""
+'''
+
+
+def test_parse_modelfile() -> None:
+    spec = parse_modelfile(MODELFILE)
+    assert spec["from"] == "/opt/dhaos/models/dhaos.gguf"
+    assert spec["template"].startswith("{{ if .System }}<|im_start|>system\n") and spec["template"].endswith("{{ .Prompt }}")
+    assert spec["system"] == "Tu es dhaos."
+    assert spec["parameters"] == {"stop": ["<|im_end|>", "<|endoftext|>"], "temperature": 0.7, "num_ctx": 8192}
+    one_line = parse_modelfile('FROM x.gguf\nSYSTEM """court"""\nTEMPLATE "{{ .Prompt }}"\n')
+    assert one_line["system"] == "court" and one_line["template"] == "{{ .Prompt }}"
+
+
+def test_import_modelfile_uploads_then_creates(settings: Settings, tmp_path: _Path) -> None:
+    import hashlib
+
+    weights = tmp_path / "dhaos.gguf"
+    weights.write_bytes(b"GGUF" + b"\x00" * 500)
+    digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+    modelfile = tmp_path / "Modelfile"
+    modelfile.write_text(MODELFILE.replace("/opt/dhaos/models/dhaos.gguf", "dhaos.gguf"), encoding="utf-8")
+    calls: list[tuple[str, str, Any]] = []
+    uploaded: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/api/blobs/"):
+            if request.method == "HEAD":
+                calls.append(("HEAD", path, None))
+                return httpx.Response(200 if path.split(":")[-1] in uploaded else 404)
+            uploaded[path.split(":")[-1]] = len(request.read())
+            calls.append(("POST", path, None))
+            return httpx.Response(201)
+        body = json.loads(request.content)
+        calls.append((request.method, path, body))
+        return httpx.Response(200, json={"status": "success"})
+
+    backend, _ = make_backend(settings, handler)
+    logs: list[str] = []
+    result = backend.import_modelfile(modelfile, "dhaos", on_log=logs.append)
+    assert result == {"status": "success"}
+    assert calls[0] == ("HEAD", f"/api/blobs/sha256:{digest}", None)
+    assert calls[1] == ("POST", f"/api/blobs/sha256:{digest}", None) and uploaded[digest] == 504
+    create = calls[2]
+    assert create[0] == "POST" and create[1] == "/api/create"
+    assert create[2]["model"] == "dhaos" and create[2]["files"] == {"dhaos.gguf": f"sha256:{digest}"}
+    assert create[2]["system"] == "Tu es dhaos." and create[2]["parameters"]["num_ctx"] == 8192 and create[2]["stream"] is False
+    assert any("téléversement" in line for line in logs)
+    # seconde importation : le blob existe, pas de nouveau téléversement
+    calls.clear()
+    backend.import_modelfile(modelfile, "dhaos")
+    assert [c[0] for c in calls] == ["HEAD", "POST"] and calls[1][1] == "/api/create"
+
+
+def test_import_modelfile_errors(settings: Settings, tmp_path: _Path) -> None:
+    backend, _ = make_backend(settings, lambda r: httpx.Response(200, json={}))
+    bad = tmp_path / "Modelfile"
+    bad.write_text("FROM absent.gguf\n", encoding="utf-8")
+    with pytest.raises(BackendError, match="introuvable"):
+        backend.import_modelfile(bad)
+    bad.write_text("SYSTEM x\n", encoding="utf-8")
+    with pytest.raises(BackendError, match="sans FROM"):
+        backend.import_modelfile(bad)

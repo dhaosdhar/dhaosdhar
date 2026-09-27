@@ -4,9 +4,11 @@
 commutable : un modèle **Ollama** en local (par défaut `qwen2.5-coder:7b`) ou **Claude** via l'API
 Anthropic. Il lit votre disque, modifie vos fichiers, lance des commandes, cherche sur le web et consulte
 des **bases de savoir locales** organisées par catégorie (SQLite + FTS5, recherche hybride vecteurs +
-mots-clés). Il s'utilise en **ligne de commande** (`dhaos chat`, `dhaos ask`) ou par une **API HTTP**
-(`dhaos serve`), et embarque un module d'**entraînement** qui transforme vos conversations en jeux de
-données. Python ≥ 3.11, Linux en priorité. Version 0.1.0.
+mots-clés). Il s'utilise dans une **interface de bureau** (`dhaos gui`, Tkinter, plusieurs conversations à la
+fois), en **ligne de commande** (`dhaos chat`, `dhaos ask`) ou par une **API HTTP** avec interface web (`dhaos serve`),
+et embarque un module d'**entraînement** qui transforme vos conversations en jeux de données. Le modèle par
+défaut s'appelle **`dhaos`** : un modèle Ollama construit sur les poids d'un modèle ouvert (`qwen2.5-coder`), avec
+l'identité et les paramètres de l'assistant. Python ≥ 3.11, Linux en priorité. Version 0.1.0.
 
 ## Un mot d'honnêteté sur « notre propre LLM »
 
@@ -53,15 +55,23 @@ Service permanent : `systemctl --user enable --now dhaos-api` (ou, pour un compt
 qui enregistre un jeton stable dans la configuration (`api.token`) la première fois.
 
 Construire le paquet depuis les sources : `packaging/build-deb.sh` (paquet `all` léger, dépendances
-depuis PyPI à l'installation) ou `packaging/build-deb.sh --offline 3.14` (roues embarquées pour
-Python 3.14 x86_64, installable sans réseau). Le script vérifie le paquet ré-extrait (`md5sums`,
-scripts, présence de l'interface).
+depuis PyPI à l'installation), `--offline 3.14` (roues embarquées pour Python 3.14 x86_64, installable sans
+réseau), et surtout **`--with-model qwen2.5-coder:7b`** : les poids du modèle (présent dans le dépôt Ollama
+local, ~4,7 Go pour un 7B, ~1,9 Go pour un 3B) et son Modelfile sont embarqués ; à l'installation,
+`dhaos model import` crée le modèle `dhaos` dans Ollama **sans aucun téléchargement**. Le paquet pèse alors
+la taille des poids. Ollama lui-même s'installe avec son installeur officiel (`dhaos-setup` le lance si
+besoin). Le script vérifie le paquet ré-extrait (`md5sums`, scripts, interface, modèle).
+
+```sh
+packaging/build-deb.sh --with-model qwen2.5-coder:7b --num-ctx 8192   # sudo -E si le dépôt Ollama appartient au service
+sudo apt install ./dist/dhaos_0.1.0_amd64.deb -y                     # ~5 Go ; le modèle est importé si Ollama tourne
+```
 
 **Ollama** (cerveau local, recommandé pour démarrer) :
 
 ```sh
 curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5-coder:7b     # modèle de conversation par défaut
+ollama pull qwen2.5-coder:7b     # poids de base du modèle dhaos (dhaos model create les habille)
 ollama pull nomic-embed-text     # modèle d'embeddings des bases de savoir
 ```
 
@@ -244,7 +254,7 @@ Priorité : valeurs par défaut < fichier TOML < environnement. Exemples :
 |---|---|
 | `paths` | `data_dir` (XDG), `project_root` (répertoire courant) |
 | `backends` | `default` (`ollama`) |
-| `backends.ollama` | `host` (`http://127.0.0.1:11434`), `model` (`qwen2.5-coder:7b`), `embed_model` (`nomic-embed-text`), `timeout` (300 s), `num_ctx` (16384), `keep_alive` (non défini, ex. `"30m"`) |
+| `backends.ollama` | `host` (`http://127.0.0.1:11434`), `model` (`dhaos`), `base_model` (`qwen2.5-coder:7b`), `embed_model` (`nomic-embed-text`), `timeout` (300 s), `num_ctx` (16384), `keep_alive` (non défini, ex. `"30m"`) |
 | `backends.claude` | `model` (`claude-opus-5`), `max_tokens` (64000), `effort` (`xhigh` ; `low`…`max`), `thinking_display` (`omitted`/`summarized`), `fallbacks` (true), `timeout` (600 s), `base_url` |
 | `tools` | voir [garde-fous](#ce-que-lagent-peut-faire-et-les-garde-fous) |
 | `web` | `provider` (`duckduckgo` / `searxng` + `searxng_url` / `brave` + `brave_api_key`), `max_results` (8), `fetch_max_chars` (40000), `timeout` (20 s), `user_agent` |
@@ -263,6 +273,34 @@ dhaos config set agent.max_iterations 60  # valeur validée (clé inconnue ou ty
 ```
 
 `config.example.toml` à la racine du dépôt documente chaque section.
+
+## Interface de bureau (`dhaos gui`)
+
+Application Python/Tkinter, sans dépendance externe (paquet `python3-tk`) — c'est ce qu'ouvre le lanceur
+« dhaos » du menu des applications :
+
+- **Onglets = conversations simultanées**, chacune avec sa session et son fil d'agent (Ctrl+N nouvelle, Ctrl+W fermer) ;
+- **fil de conversation** complet, reprise d'une session passée avec tout son historique (liste à gauche) ;
+- appels d'outils affichés en ligne avec leur résultat, **confirmations en ligne** (Oui / Non) pour les actions sensibles ;
+- indicateur d'activité avec le temps écoulé ; choix du cerveau (Ollama / Claude) et du modèle par conversation ;
+- menu **Outils** : bases de savoir (créer, fichiers, dossier, URL, note, recherche, renommer, réindexer, supprimer),
+  journal des actions, réglages, création du modèle `dhaos` dans Ollama.
+
+```sh
+sudo apt install python3-tk      # si Tkinter manque (Ubuntu/Debian)
+dhaos gui
+```
+
+## Le modèle `dhaos`
+
+`dhaos model create` construit dans Ollama un modèle nommé **`dhaos`** à partir des poids de
+`backends.ollama.base_model` (`qwen2.5-coder:7b` par défaut) : identité de l'assistant (`SYSTEM`) et
+fenêtre de contexte (`num_ctx`), sans dupliquer les poids (Ollama partage les couches). C'est le modèle par
+défaut (`backends.ollama.model = "dhaos"`) ; `dhaos-setup` le crée. Commandes : `dhaos model create
+[--base NOM]`, `list`, `show`, `remove NOM`, `import` (modèle livré dans un paquet, voir ci-dessous).
+
+Honnêteté : les poids restent ceux du modèle de base tant qu'aucun fine-tuning n'a été fait ; c'est la
+section [Entraînement](#entraînement) qui rend le modèle réellement vôtre.
 
 ## Interface web
 

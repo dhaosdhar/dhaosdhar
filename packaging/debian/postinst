@@ -8,6 +8,14 @@ case "$1" in
       echo "        Vérifiez l'accès réseau (PyPI) puis relancez : sudo /opt/dhaos/install-venv.sh" >&2
       exit 1
     fi
+    if [ -f /opt/dhaos/models/Modelfile ]; then
+      if curl -fs http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+        echo "dhaos : importation du modèle livré dans Ollama (une seule fois, quelques minutes)…"
+        /usr/bin/dhaos model import --no-set-default || echo "dhaos : importation différée — lancez plus tard : dhaos model import" >&2
+      else
+        echo "dhaos : modèle livré dans /opt/dhaos/models ; Ollama ne répond pas encore — dhaos-setup l'importera."
+      fi
+    fi
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
@@ -17,7 +25,7 @@ case "$1" in
     cat <<'MSG'
 
 dhaos est installé.
-  1. En tant qu'utilisateur (pas root) : dhaos-setup      # installe Ollama et télécharge les modèles
+  1. En tant qu'utilisateur (pas root) : dhaos-setup      # Ollama + modèle dhaos (livré ou téléchargé) + configuration
   2. Puis : dhaos gui                                      # interface de bureau (ou « dhaos » dans le menu des applications)
      ou : systemctl --user enable --now dhaos-api          # service permanent, interface sur http://127.0.0.1:8642/
 MSG

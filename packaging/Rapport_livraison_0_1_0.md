@@ -18,21 +18,35 @@
 
 Variante hors ligne : `packaging/build-deb.sh --offline 3.14` embarque les roues des dépendances (paquet `amd64`).
 
-## 2 · Les modèles
+## 2 · Interface de bureau et modèle `dhaos`
 
-Un modèle Ollama pèse 2 à 5 Go : il n'est **pas** dans le paquet. `dhaos-setup` installe Ollama
-(script officiel, via sudo), attend le service, choisit `qwen2.5-coder:7b` si ≥ 9 Go de mémoire sont
-disponibles, sinon `qwen2.5-coder:3b`, télécharge aussi `nomic-embed-text` (embeddings des bases), et
-règle `backends.ollama.model`, `keep_alive = 30m` et, sous 16 Go de RAM, `num_ctx = 8192`.
+- `dhaos gui` (lanceur « dhaos » du menu) : application Python/Tkinter — onglets = conversations simultanées, fil
+  complet, confirmations en ligne, bases de savoir, journal, réglages. Dépendance `python3-tk` déclarée.
+- Le modèle par défaut est `dhaos`, un modèle Ollama construit sur `qwen2.5-coder` (identité + paramètres) ;
+  `dhaos-setup` le crée (`dhaos model create`) ou l'importe s'il est livré dans le paquet.
+- **Non exécuté ici** : l'interface Tkinter (le conteneur de construction n'a pas Tk) — code vérifié par analyse
+  statique et contrôleur testé sans affichage (8 tests) ; à essayer en premier chez l'utilisateur.
+
+## 3 · Les modèles
+
+Deux variantes de paquet :
+
+- `dhaos_0.1.0_all.deb` (188 Ko) : sans poids ; `dhaos-setup` installe Ollama (installeur officiel, via sudo),
+  choisit `qwen2.5-coder:7b` si ≥ 9 Go de mémoire sont disponibles, sinon `:3b`, télécharge les poids et
+  `nomic-embed-text`, puis crée le modèle `dhaos`.
+- `dhaos_0.1.0_amd64.deb` construit avec `--with-model` : poids + Modelfile dans `/opt/dhaos/models` ;
+  `postinst` importe le modèle si Ollama répond, sinon `dhaos-setup` le fait ; aucun téléchargement de
+  poids. Chaîne validée ici avec un dépôt Ollama factice (export, construction, installation, importation
+  différée, purge).
 
 ## À TESTER
 
 1. `sudo apt install ./dhaos_0.1.0_all.deb -y` → message final « dhaos est installé », `dhaos version` affiche `dhaos 0.1.0`.
 2. `dhaos-setup` (sans sudo) → Ollama présent, `ollama list` montre le modèle choisi et `nomic-embed-text`, `dhaos backends` affiche « ok ».
-3. `dhaos ui` → le navigateur s'ouvre sur `http://127.0.0.1:8642/`, point vert « prêt » en haut à droite ; poser une question, voir les appels d'outils (`⚙`).
+3. `dhaos gui` → la fenêtre s'ouvre (onglet « Nouvelle conversation ») ; `dhaos ui` → le navigateur s'ouvre sur `http://127.0.0.1:8642/`, point vert « prêt » en haut à droite ; poser une question, voir les appels d'outils (`⚙`).
 4. Dans l'interface, demander « crée un fichier essai.txt dans /tmp » → une carte **Confirmation demandée** apparaît (écriture hors projet) ; refuser → l'agent reçoit le refus.
 5. Onglet **Bases de savoir** : créer `developpeur`, ingérer `/usr/share/doc/dhaos/README.md`, chercher « politique d'accès » → passages affichés ; poser la question dans la conversation → l'agent appelle `kb_search`.
-6. Menu des applications → « dhaos » ouvre l'interface (même serveur, même jeton).
+6. Menu des applications → « dhaos » ouvre l'interface de bureau ; deux onglets peuvent travailler en même temps.
 7. `systemctl --user enable --now dhaos-api` puis fermer le terminal → l'interface reste accessible.
 8. `sudo apt remove dhaos` → `/opt/dhaos/venv` supprimé ; `sudo apt purge dhaos` → `/opt/dhaos` supprimé ; `~/.config/dhaos` et `~/.local/share/dhaos` (données) conservés.
 

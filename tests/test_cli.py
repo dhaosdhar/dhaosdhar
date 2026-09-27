@@ -995,3 +995,28 @@ def test_model_create_requires_base(invoke: Invoke, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(cli, "_ollama_backend", lambda ctx: (cli._settings(ctx), fake))
     r = invoke("model", "create", "--base", "qwen2.5-coder:3b")
     assert r.exit_code == 1 and "ollama pull qwen2.5-coder:3b" in r.output and not fake.created
+
+
+def test_model_import_command(invoke: Invoke, cfg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dhaos.cli import main as cli
+
+    class FakeImporter(_FakeOllama):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.imported: list[tuple[Path, str]] = []
+
+        def import_modelfile(self, modelfile: Path, name: str = "dhaos", *, on_log: Any = None) -> dict[str, Any]:
+            if on_log:
+                on_log("téléversement…")
+            self.imported.append((modelfile, name))
+            return {"status": "success"}
+
+    fake = FakeImporter()
+    monkeypatch.setattr(cli, "_ollama_backend", lambda ctx: (cli._settings(ctx), fake))
+    modelfile = tmp_path / "Modelfile"
+    modelfile.write_text("FROM dhaos.gguf\n", encoding="utf-8")
+    r = invoke("model", "import", "--modelfile", str(modelfile))
+    assert r.exit_code == 0, r.output
+    assert fake.imported == [(modelfile, "dhaos")] and _read_cfg(cfg)["backends"]["ollama"]["model"] == "dhaos"
+    r = invoke("model", "import", "--modelfile", str(tmp_path / "absent"))
+    assert r.exit_code == 1 and "introuvable" in r.output

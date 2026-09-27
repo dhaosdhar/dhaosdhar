@@ -1,27 +1,31 @@
 #!/bin/bash
 # Construit le paquet Debian de dhaos et le contrôle (paquet ré-extrait).
 #
-#   packaging/build-deb.sh [--offline PYVER] [--out DIR]
+#   packaging/build-deb.sh [--offline PYVER] [--with-model BASE] [--num-ctx N] [--out DIR]
 #
-# Sans --offline : paquet « all » léger, les dépendances Python sont
-# installées depuis PyPI par postinst. Avec --offline 3.14 : les roues des
-# dépendances pour cette version de Python (x86_64) sont embarquées, paquet
-# « amd64 » installable sans réseau.
+# Sans option : paquet « all » léger, dépendances Python installées depuis
+# PyPI par postinst. --offline 3.14 : roues des dépendances embarquées
+# (Python 3.14 x86_64), installation sans réseau. --with-model BASE : les
+# poids du modèle Ollama BASE (présent localement) sont embarqués avec un
+# Modelfile ; à l'installation, `dhaos model import` crée le modèle « dhaos »
+# dans Ollama sans téléchargement. Le paquet pèse alors la taille des poids.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT="$ROOT/dist"; OFFLINE_PY=""
+OUT="$ROOT/dist"; OFFLINE_PY=""; WITH_MODEL=""; NUM_CTX=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --offline) OFFLINE_PY="$2"; shift 2 ;;
+    --with-model) WITH_MODEL="$2"; shift 2 ;;
+    --num-ctx) NUM_CTX="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "option inconnue : $1" >&2; exit 2 ;;
   esac
 done
 PY="$ROOT/.venv/bin/python"; [ -x "$PY" ] || PY=python3
 VERSION=$(grep -m1 '^version' "$ROOT/pyproject.toml" | sed 's/.*"\(.*\)".*/\1/')
 [ -n "$VERSION" ] || { echo "version introuvable dans pyproject.toml" >&2; exit 1; }
-ARCH=all; [ -n "$OFFLINE_PY" ] && ARCH=amd64
+ARCH=all; { [ -n "$OFFLINE_PY" ] || [ -n "$WITH_MODEL" ]; } && ARCH=amd64
 BUILD="$ROOT/build/deb"; STAGE="$BUILD/dhaos"; CHECK="$BUILD/check"
 rm -rf "$BUILD"; mkdir -p "$STAGE/DEBIAN" "$OUT"
 echo "== dhaos $VERSION ($ARCH) =="
@@ -36,6 +40,12 @@ if [ -n "$OFFLINE_PY" ]; then
   "$PY" -m pip download --quiet -r "$ROOT/packaging/requirements.txt" -d "$STAGE/opt/dhaos/wheels" \
     --python-version "$OFFLINE_PY" --only-binary=:all: --implementation cp \
     --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux_2_26_x86_64 --platform manylinux_2_27_x86_64
+fi
+
+# --- modèle embarqué (poids + Modelfile) depuis le dépôt Ollama local
+if [ -n "$WITH_MODEL" ]; then
+  echo "-- export du modèle $WITH_MODEL depuis le dépôt Ollama local…"
+  "$PY" "$ROOT/packaging/export_model.py" --base "$WITH_MODEL" --out "$STAGE/opt/dhaos/models" ${NUM_CTX:+--num-ctx "$NUM_CTX"}
 fi
 
 # --- fichiers
@@ -57,7 +67,9 @@ sed -e "s/@VERSION@/$VERSION/" -e "s/@ARCH@/$ARCH/" -e "s/@SIZE@/$SIZE/" "$ROOT/
 ( cd "$STAGE" && find . -type f -not -path './DEBIAN/*' -printf '%P\n' | sort | xargs md5sum > DEBIAN/md5sums )
 find "$STAGE" -type d -exec chmod 0755 {} +
 DEB="$OUT/dhaos_${VERSION}_${ARCH}.deb"
-dpkg-deb --build --root-owner-group "$STAGE" "$DEB" >/dev/null
+# Les poids d'un modèle ne se compressent pas : gzip rapide plutôt que xz (minutes vs heures).
+COMPRESS=(); [ -n "$WITH_MODEL" ] && COMPRESS=(-Zgzip -z1)
+dpkg-deb --build --root-owner-group "${COMPRESS[@]}" "$STAGE" "$DEB" >/dev/null
 
 # --- contrôles sur le paquet construit (ré-extrait)
 mkdir -p "$CHECK"; dpkg-deb -x "$DEB" "$CHECK"; dpkg-deb -e "$DEB" "$CHECK/DEBIAN"
@@ -72,5 +84,8 @@ names = zipfile.ZipFile(w).namelist()
 assert any(n.endswith("ui/index.html") for n in names), "interface web absente de la roue"
 print(f"roue : {w.name} ({len(names)} fichiers, interface web incluse)")
 PYEOF
+if [ -n "$WITH_MODEL" ]; then
+  [ -s "$CHECK/opt/dhaos/models/dhaos.gguf" ] && [ -s "$CHECK/opt/dhaos/models/Modelfile" ] && echo "modèle embarqué : $(du -h "$CHECK/opt/dhaos/models/dhaos.gguf" | cut -f1) (base $WITH_MODEL)"
+fi
 echo "paquet : $DEB ($(du -h "$DEB" | cut -f1))"
 dpkg-deb --info "$DEB" | sed -n '/Package:/,/Depends:/p' | sed 's/^/  /'

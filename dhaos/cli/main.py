@@ -1170,6 +1170,32 @@ def model_create(
         success(f"modèle par défaut : {name} (backends.ollama.model)")
 
 
+@model_app.command("import")
+def model_import(
+    ctx: typer.Context,
+    modelfile: Path = typer.Option(Path("/opt/dhaos/models/Modelfile"), "--modelfile", help="Modelfile dont FROM désigne un fichier GGUF."),
+    name: str = typer.Option("dhaos", "--name", help="Nom du modèle créé."),
+    set_default: bool = typer.Option(True, "--set-default/--no-set-default", help="Enregistrer ce modèle comme modèle par défaut."),
+) -> None:
+    """Importer dans Ollama le modèle livré avec le paquet (poids GGUF + Modelfile), sans réseau."""
+    from ..backends.base import BackendError
+
+    settings, backend = _ollama_backend(ctx)
+    if not modelfile.is_file():
+        fail(f"Modelfile introuvable : {modelfile} (paquet construit sans modèle ? `packaging/build-deb.sh --with-model`)")
+        raise typer.Exit(1)
+    try:
+        result = backend.import_modelfile(modelfile, name, on_log=note)
+    except (BackendError, OSError) as e:
+        fail(str(e))
+        raise typer.Exit(1) from e
+    status_text = str(result.get("status", "")) if isinstance(result, dict) else ""
+    success(f"modèle {name} importé ({status_text or 'ok'})")
+    if set_default:
+        _write_config_keys(settings, {"backends.ollama.model": name})
+        success(f"modèle par défaut : {name}")
+
+
 @model_app.command("list")
 def model_list(ctx: typer.Context) -> None:
     """Modèles présents dans Ollama."""
