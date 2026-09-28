@@ -6,4 +6,4 @@ et un module d'entraînement (collecte de traces, modèle nano *from scratch*,
 fine-tuning LoRA d'un modèle ouvert).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -8,7 +8,7 @@ mots-clés). Il s'utilise dans une **interface de bureau** (`dhaos gui`, Tkinter
 fois), en **ligne de commande** (`dhaos chat`, `dhaos ask`) ou par une **API HTTP** avec interface web (`dhaos serve`),
 et embarque un module d'**entraînement** qui transforme vos conversations en jeux de données. Le modèle par
 défaut s'appelle **`dhaos`** : un modèle Ollama construit sur les poids d'un modèle ouvert (`qwen2.5-coder`), avec
-l'identité et les paramètres de l'assistant. Python ≥ 3.11, Linux en priorité. Version 0.1.0.
+l'identité et les paramètres de l'assistant. Python ≥ 3.11, Linux en priorité. Version 0.1.1.
 
 ## Un mot d'honnêteté sur « notre propre LLM »
 
@@ -44,7 +44,7 @@ Le paquet installe l'application dans `/opt/dhaos` (environnement Python isolé)
 (plusieurs Go) ne sont pas dans le paquet : `dhaos-setup` les télécharge.
 
 ```sh
-sudo apt install ./dhaos_0.1.0_all.deb     # dépendances : python3 ≥ 3.11, python3-venv, python3-pip, curl
+sudo apt install ./dhaos_0.1.1_all.deb     # dépendances : python3 ≥ 3.11, python3-venv, python3-pip, curl
 dhaos-setup                                 # en tant qu'utilisateur : Ollama + modèles (choisis selon la RAM) + configuration
 dhaos ui                                    # ouvre l'interface web (lance le serveur en arrière-plan si besoin)
 ```
@@ -64,7 +64,7 @@ besoin). Le script vérifie le paquet ré-extrait (`md5sums`, scripts, interface
 
 ```sh
 packaging/build-deb.sh --with-model qwen2.5-coder:7b --num-ctx 8192   # sudo -E si le dépôt Ollama appartient au service
-sudo apt install ./dist/dhaos_0.1.0_amd64.deb -y                     # ~5 Go ; le modèle est importé si Ollama tourne
+sudo apt install ./dist/dhaos_0.1.1_amd64.deb -y                     # ~5 Go ; le modèle est importé si Ollama tourne
 ```
 
 **Ollama** (cerveau local, recommandé pour démarrer) :

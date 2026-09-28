@@ -1,14 +1,16 @@
-# Livraison — dhaos 0.1.0 (assistant de codage, bases de savoir, interface web)
+# Livraison — dhaos 0.1.1 (interface de bureau, modèle dhaos, paquet avec modèle)
 
-**Base :** première livraison — ce paquet contient l'application complète.
-**Déploiement :** `sudo apt install ./dhaos_0.1.0_all.deb -y`, puis `dhaos-setup` (utilisateur), puis `dhaos ui`.
+**Base :** 0.1.0 (premier paquet, interface web seule) — **ce paquet la contient et la remplace** ; `apt` le traite comme une mise à jour.
+**Déploiement :** `sudo apt install ./dhaos_0.1.1_all.deb -y`, puis `dhaos-setup` (utilisateur), puis `dhaos gui`.
+
+**Depuis 0.1.0** : interface de bureau Tkinter (`dhaos gui`, lanceur du menu), modèle Ollama `dhaos` par défaut (`dhaos model create/import/list/show/remove`), prompt système qui affirme l'accès au disque et à Internet, schémas d'outils compacts, paquet `--with-model` (poids embarqués), dépendance `python3-tk`.
 
 ## 1 · Ce que le paquet installe
 
 | Chemin | Rôle |
 |---|---|
 | `/opt/dhaos/venv` | environnement Python créé par `postinst` (dépendances épinglées, `/opt/dhaos/requirements.txt`) |
-| `/opt/dhaos/wheels/dhaos-0.1.0-py3-none-any.whl` | l'application (CLI, API, interface web) |
+| `/opt/dhaos/wheels/dhaos-0.1.1-py3-none-any.whl` | l'application (CLI, API, interface web) |
 | `/usr/bin/dhaos` | commande principale (`chat`, `ask`, `kb`, `serve`, `ui`, `train`…) |
 | `/usr/bin/dhaos-setup` | installe Ollama si absent, télécharge les modèles selon la RAM, prépare la configuration |
 | `/usr/lib/systemd/user/dhaos-api.service` | service utilisateur : `systemctl --user enable --now dhaos-api` |
@@ -31,17 +33,17 @@ Variante hors ligne : `packaging/build-deb.sh --offline 3.14` embarque les roues
 
 Deux variantes de paquet :
 
-- `dhaos_0.1.0_all.deb` (188 Ko) : sans poids ; `dhaos-setup` installe Ollama (installeur officiel, via sudo),
+- `dhaos_0.1.1_all.deb` (~210 Ko) : sans poids ; `dhaos-setup` installe Ollama (installeur officiel, via sudo),
   choisit `qwen2.5-coder:7b` si ≥ 9 Go de mémoire sont disponibles, sinon `:3b`, télécharge les poids et
   `nomic-embed-text`, puis crée le modèle `dhaos`.
-- `dhaos_0.1.0_amd64.deb` construit avec `--with-model` : poids + Modelfile dans `/opt/dhaos/models` ;
+- `dhaos_0.1.1_amd64.deb` construit avec `--with-model` : poids + Modelfile dans `/opt/dhaos/models` ;
   `postinst` importe le modèle si Ollama répond, sinon `dhaos-setup` le fait ; aucun téléchargement de
   poids. Chaîne validée ici avec un dépôt Ollama factice (export, construction, installation, importation
   différée, purge).
 
 ## À TESTER
 
-1. `sudo apt install ./dhaos_0.1.0_all.deb -y` → message final « dhaos est installé », `dhaos version` affiche `dhaos 0.1.0`.
+1. `sudo apt install ./dhaos_0.1.1_all.deb -y` → message final « dhaos est installé », `dhaos version` affiche `dhaos 0.1.1`.
 2. `dhaos-setup` (sans sudo) → Ollama présent, `ollama list` montre le modèle choisi et `nomic-embed-text`, `dhaos backends` affiche « ok ».
 3. `dhaos gui` → la fenêtre s'ouvre (onglet « Nouvelle conversation ») ; `dhaos ui` → le navigateur s'ouvre sur `http://127.0.0.1:8642/`, point vert « prêt » en haut à droite ; poser une question, voir les appels d'outils (`⚙`).
 4. Dans l'interface, demander « crée un fichier essai.txt dans /tmp » → une carte **Confirmation demandée** apparaît (écriture hors projet) ; refuser → l'agent reçoit le refus.

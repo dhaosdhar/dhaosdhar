@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dhaos"
-version = "0.1.0"
+version = "0.1.1"
 description = "Assistant de codage agentique avec bases de savoir locales — cerveau Ollama (local) ou Claude (API), commutable"
 readme = "README.md"
 requires-python = ">=3.11"
